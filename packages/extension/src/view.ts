@@ -112,6 +112,21 @@ export class DshClineView implements vscode.WebviewViewProvider, vscode.Disposab
           return
         }
         if (!isShellMessage(msg)) return
+        const m = msg as { channel: string; type: string; op?: string; text?: string }
+        // Clipboard bridge (macOS/Linux: webview swallows Cmd/Ctrl+C/V/X for the
+        // embedded iframe). copy/cut write the captured text to the VS Code
+        // clipboard; paste reads it and the shell script inserts it into the
+        // iframe's focused input.
+        if (m.type === 'clipboard') {
+          if (m.op === 'paste') {
+            void vscode.env.clipboard.readText().then(text => {
+              webview.postMessage({ channel: 'dsh-cline.shell', type: 'clipboard-result', op: 'paste', text })
+            })
+          } else if (m.op === 'copy' || m.op === 'cut') {
+            void vscode.env.clipboard.writeText(m.text ?? '')
+          }
+          return
+        }
         if (msg.type === 'shell-ready') {
           // Push the latest status in case the shell booted between renders.
           this.render(webview)
