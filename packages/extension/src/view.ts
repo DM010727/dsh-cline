@@ -111,22 +111,22 @@ export class DshClineView implements vscode.WebviewViewProvider, vscode.Disposab
           }
           return
         }
-        if (!isShellMessage(msg)) return
-        const m = msg as { channel: string; type: string; op?: string; text?: string }
-        // Clipboard bridge (macOS/Linux: webview swallows Cmd/Ctrl+C/V/X for the
-        // embedded iframe). copy/cut write the captured text to the VS Code
-        // clipboard; paste reads it and the shell script inserts it into the
-        // iframe's focused input.
-        if (m.type === 'clipboard') {
-          if (m.op === 'paste') {
+        // Clipboard bridge from the DSH iframe (relayed on dsh-cline.host-service).
+        // copy/cut write the captured text to the OS clipboard; paste reads it and
+        // the payload is relayed back down via the shell's `bridge` channel so the
+        // iframe client inserts it into the focused input.
+        const c = msg as { channel?: string; type?: string; op?: string; text?: string }
+        if (c.channel === 'dsh-cline.host-service' && c.type === 'clipboard') {
+          if (c.op === 'paste') {
             void vscode.env.clipboard.readText().then(text => {
-              webview.postMessage({ channel: 'dsh-cline.shell', type: 'clipboard-result', op: 'paste', text })
+              webview.postMessage({ channel: 'dsh-cline.shell', type: 'bridge', payload: { channel: 'clipboard-result', op: 'paste', text } })
             })
-          } else if (m.op === 'copy' || m.op === 'cut') {
-            void vscode.env.clipboard.writeText(m.text ?? '')
+          } else if (c.op === 'copy' || c.op === 'cut') {
+            void vscode.env.clipboard.writeText(c.text ?? '')
           }
           return
         }
+        if (!isShellMessage(msg)) return
         if (msg.type === 'shell-ready') {
           // Push the latest status in case the shell booted between renders.
           this.render(webview)

@@ -19,6 +19,7 @@ import { SsyOnboarding } from './onboarding.tsx'
 import { DshClineSection } from './section.tsx'
 import { DshClineModelsSection } from './models-section.tsx'
 import { CLIENT_CSS } from './styles.ts'
+import { installClipboard } from './clipboard.ts'
 
 /** Required services (cordis fiber inject, same contract as ui-settings-models). */
 export const inject = ['slots', 'locale', 'connection', 'remote', 'theme']
@@ -34,6 +35,10 @@ const MODELS_NAV_LABELS = new Set(['模型', 'Models'])
  * @param ctx - client root context.
  */
 export function apply(ctx: ClientContext): void {
+  // Clipboard bridge + right-click menu for the DSH inputs (webview iframe
+  // swallows native Cmd/Ctrl+C/V and the native context menu; see clipboard.ts).
+  installClipboard()
+
   // One style tag for all hand-prefixed classes plus the brand re-label.
   ctx.effect(() => {
     const tag = document.createElement('style')
