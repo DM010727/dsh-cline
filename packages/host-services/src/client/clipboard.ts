@@ -36,34 +36,40 @@ function selectionText(): string {
   return window.getSelection()?.toString() ?? ''
 }
 
+/** Set a controlled input's value via the NATIVE setter so React's value
+ * tracker sees it (assigning `.value` directly bypasses React, so a re-render
+ * reverts the field to the old — blank — state until the user types). */
+function setNativeValue(input: HTMLInputElement | HTMLTextAreaElement, value: string, caret: number): void {
+  const proto = input instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype
+  const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set
+  if (setter) setter.call(input, value)
+  input.setSelectionRange(caret, caret)
+  input.dispatchEvent(new Event('input', { bubbles: true }))
+}
+
 /** Paste `text` into the focused editable (or fall back to execCommand). */
 function insertText(text: string): void {
   const el = document.activeElement as HTMLElement | null
-  if (isEditable(el) && el) {
-    if (el.isContentEditable) {
-      document.execCommand('insertText', false, text)
-    } else {
-      const input = el as HTMLInputElement
-      const s = input.selectionStart ?? input.value.length
-      const e = input.selectionEnd ?? input.value.length
-      input.value = input.value.slice(0, s) + text + input.value.slice(e)
-      const caret = s + text.length
-      input.setSelectionRange(caret, caret)
-      input.dispatchEvent(new Event('input', { bubbles: true }))
-    }
+  if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) {
+    const input = el as HTMLInputElement
+    const s = input.selectionStart ?? input.value.length
+    const e = input.selectionEnd ?? input.value.length
+    setNativeValue(input, input.value.slice(0, s) + text + input.value.slice(e), s + text.length)
+  } else if (el && el.isContentEditable) {
+    el.focus()
+    document.execCommand('insertText', false, text)
   } else {
     document.execCommand('insertText', false, text)
   }
 }
 
-/** Remove the current selection (cut from a non-input element). */
+/** Remove the current selection (cut from a controlled input / element). */
 function clearSelection(): void {
   const el = document.activeElement as HTMLInputElement | null
   if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) {
     const s = el.selectionStart ?? el.value.length
     const e = el.selectionEnd ?? el.value.length
-    el.value = el.value.slice(0, s) + el.value.slice(e)
-    el.setSelectionRange(s, s)
+    setNativeValue(el, el.value.slice(0, s) + el.value.slice(e), s)
   } else {
     const sel = window.getSelection()
     if (sel && sel.rangeCount) sel.deleteFromDocument()
