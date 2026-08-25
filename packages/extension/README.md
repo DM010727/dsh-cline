@@ -59,9 +59,20 @@ DSH Cline 由 [SSYCloud 胜算云](https://www.shengsuanyun.com/?from=CH_L5K542D
 
 > 🎁 新用户通过 <https://www.shengsuanyun.com/?from=CH_L5K542DT> 注册，即可领取 **6.66 元 Token 体验额度**。
 
-## 开源与反馈
+## 开源与致谢
 
-本项目由 SSYCloud 胜算云开源项目团队维护，参考了 Cline 的 VS Code 生态实现，基于 DeepSeek Harness（DSH）构建。欢迎反馈问题与建议。
+DSH Cline 已开源，遵循 **MIT License**。
+
+- **源码仓库**：[github.com/DM010727/dsh-cline](https://github.com/DM010727/dsh-cline) — 欢迎 Star、反馈 Issue 与 PR。
+
+本项目站在两个优秀的开源项目之上，由衷感谢：
+
+- **[DeepSeek Harness（DSH）](https://github.com/deepseek-ai/deepseek-harness)** — 项目底层的 Agent 内核（工具调用、MCP、Checkpoint、任务执行），由 DeepSeek 团队倾力打造。
+- **[Cline](https://github.com/cline/cline)** — 我们参考并移植了它久经考验的 VS Code 生态交互：实时编辑 diff、选中代码动作、`@` 上下文引用、编辑器直接赋能 Agent。
+
+感谢以上开源社区与开发者，也感谢每一位使用和支持 DSH Cline 的朋友。
+
+本项目由 **SSYCloud 胜算云开源项目团队**开发并持续维护。
 
 ---
 
