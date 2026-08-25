@@ -1,0 +1,44 @@
+{
+  "name": "@dsh-cline/host-services",
+  "version": "0.4.3",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "description": "DSH cordis plugin: vscode.* host services bridged to the DSH Cline VS Code extension host, plus the Shengsuanyun onboarding + settings web UI (dual-face plugin)",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-cordis-client-runner",
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ],
+      "platform": "web",
+      "immediately": true
+    }
+  },
+  "files": [
+    "lib",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node esbuild.client.mjs",
+    "build:client": "node esbuild.client.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json",
+    "install:profile": "node scripts/install-profile.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^18.3.0",
+    "esbuild": "^0.25.0",
+    "react": "^18.2.0",
+    "typescript": "^5.8.0"
+  }
+}

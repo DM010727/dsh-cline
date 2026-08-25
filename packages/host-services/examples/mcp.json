@@ -1,0 +1,19 @@
+{
+  "servers": {
+    "everything": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-everything"]
+    },
+    "filesystem": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "C:\\Users\\Administrator\\Desktop"]
+    },
+    "remote-api": {
+      "transport": "streamable-http",
+      "url": "http://127.0.0.1:3000/mcp",
+      "headers": { "Authorization": "Bearer CHANGE_ME" }
+    }
+  }
+}

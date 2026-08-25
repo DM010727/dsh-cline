@@ -1,0 +1,158 @@
+{
+  "name": "dsh-cline",
+  "displayName": "DSH Cline",
+  "description": "Deepseek harness 开源插件",
+  "version": "4.1.4",
+  "license": "MIT",
+  "publisher": "shengsuan-cloud",
+  "private": true,
+  "icon": "media/dsh-cline.png",
+  "keywords": [
+    "deepseek",
+    "harness",
+    "agent",
+    "agent-ai",
+    "autonomous",
+    "chatgpt",
+    "claude",
+    "cline",
+    "coding",
+    "dev",
+    "keybindings",
+    "llama",
+    "mcp",
+    "skill",
+    "ai",
+    "openrouter",
+    "sonnet"
+  ],
+  "engines": {
+    "vscode": "^1.93.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Machine Learning",
+    "Programming Languages",
+    "Debuggers",
+    "Testing",
+    "SCM Providers"
+  ],
+  "main": "./dist/extension.js",
+  "files": [
+    "dist",
+    "media",
+    "README.md",
+    "LICENSE"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "dsh-cline",
+          "title": "DSH Cline",
+          "icon": "media/dsh-cline.png"
+        }
+      ]
+    },
+    "views": {
+      "dsh-cline": [
+        {
+          "type": "webview",
+          "id": "dsh-cline.sidebar",
+          "name": "DSH Cline"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "dsh-cline.openPanel",
+        "title": "在编辑器面板中打开",
+        "category": "DSH Cline"
+      },
+      {
+        "command": "dsh-cline.restoreCheckpoint",
+        "title": "恢复检查点...",
+        "category": "DSH Cline"
+      },
+      {
+        "command": "dsh-cline.restartSidecar",
+        "title": "重启 DSH 服务",
+        "category": "DSH Cline"
+      },
+      {
+        "command": "dsh-cline.addToChat",
+        "title": "添加到 DSH Cline",
+        "category": "DSH Cline"
+      },
+      {
+        "command": "dsh-cline.explainCode",
+        "title": "用 DSH Cline 解释",
+        "category": "DSH Cline"
+      },
+      {
+        "command": "dsh-cline.improveCode",
+        "title": "用 DSH Cline 优化",
+        "category": "DSH Cline"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "dsh-cline.addToChat",
+          "group": "navigation@1",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "dsh-cline.explainCode",
+          "group": "navigation@2",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "dsh-cline.improveCode",
+          "group": "navigation@3",
+          "when": "editorHasSelection"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "DSH Cline",
+      "properties": {
+        "dsh-cline.dshCommand": {
+          "type": "string",
+          "default": "dsh",
+          "markdownDescription": "`dsh` 可执行文件名或绝对路径（需为 0.1.0-rc.5 及以上，内置 web profile）。"
+        },
+        "dsh-cline.host": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "markdownDescription": "DSH 服务绑定地址（DSH 仅支持 127.0.0.1）。"
+        },
+        "dsh-cline.diffOnEdit": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "edit/write 工具执行后，自动在 VS Code 原生 diff 编辑器中呈现变更（Cline 式体验）。"
+        },
+        "dsh-cline.port": {
+          "type": "number",
+          "default": 52341,
+          "markdownDescription": "DSH 服务端口（固定端口，终端常驻方案无法使用随机端口）。本地已有 `dsh web` 跑在同一端口时插件会直接绑定它。"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@dsh-cline/protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.8.0"
+  }
+}
