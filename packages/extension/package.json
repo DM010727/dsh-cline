@@ -5,7 +5,7 @@
   "version": "4.1.4",
   "license": "MIT",
   "publisher": "shengsuan-cloud",
-  "private": true,
+  "private": false,
   "icon": "media/dsh-cline.png",
   "keywords": [
     "deepseek",
@@ -154,5 +154,9 @@
     "@types/vscode": "^1.85.0",
     "esbuild": "^0.25.0",
     "typescript": "^5.8.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DM010727/dsh-cline.git"
   }
 }
