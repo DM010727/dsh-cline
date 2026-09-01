@@ -92,6 +92,27 @@ async function openExternal(url) {
   }
   window.open(url, "_blank", "noopener");
 }
+async function ssyLogin() {
+  const response = await fetch("/dsh-cline/ssy-login", { method: "POST" });
+  if (!response.ok) throw new Error("\u53D1\u8D77\u80DC\u7B97\u4E91\u767B\u5F55\u5931\u8D25\uFF08HTTP " + String(response.status) + "\uFF09");
+}
+async function fetchSsyAccount() {
+  const response = await fetch("/dsh-cline/ssy-account");
+  if (!response.ok) throw new Error("\u83B7\u53D6\u80DC\u7B97\u4E91\u8D26\u6237\u4FE1\u606F\u5931\u8D25\uFF08HTTP " + String(response.status) + "\uFF09");
+  return await response.json();
+}
+function listenSsyKey(onKey) {
+  const listener = (ev) => {
+    const d = ev.data;
+    if (d !== null && typeof d === "object" && d.channel === "dsh-cline.ssy-key" && typeof d.apiKey === "string") {
+      onKey(d.apiKey);
+    }
+  };
+  window.addEventListener("message", listener);
+  return () => {
+    window.removeEventListener("message", listener);
+  };
+}
 async function readVscodeConfig(key) {
   const response = await fetch("/dsh-cline/vscode-config?key=" + encodeURIComponent(key));
   if (!response.ok) throw new Error("\u8BFB\u53D6 VS Code \u914D\u7F6E\u5931\u8D25\uFF08HTTP " + String(response.status) + "\uFF09");
@@ -377,6 +398,13 @@ function deriveKeyRef(provider) {
 
 // src/client/ssy-models.tsx
 var import_jsx_runtime = require("react/jsx-runtime");
+var NOT_FREE_IDS = /* @__PURE__ */ new Set(["deepseek/deepseek-v3.1-think"]);
+function isFreeModel(model) {
+  if (NOT_FREE_IDS.has(model.id)) return false;
+  const p = model.pricing;
+  if (p === void 0) return false;
+  return Number(p.price) === 0 && Number(p.input_price) === 0 && Number(p.output_price) === 0 && Number(p.cached_price ?? p.price) === 0;
+}
 function SsyModelSelect(props) {
   const { value, onChange, compact = false } = props;
   const [models, setModels] = (0, import_react.useState)([]);
@@ -399,8 +427,11 @@ function SsyModelSelect(props) {
   const grouped = (0, import_react.useMemo)(() => {
     const needle = filter.trim().toLowerCase();
     const matched = models.filter((m) => needle === "" || m.id.toLowerCase().includes(needle) || (m.name ?? "").toLowerCase().includes(needle) || (m.company ?? "").toLowerCase().includes(needle));
+    const free = matched.filter(isFreeModel);
+    const paid = matched.filter((m) => !isFreeModel(m));
     const groups = /* @__PURE__ */ new Map();
-    for (const model of matched) {
+    if (free.length > 0) groups.set("\u514D\u8D39\u6A21\u578B\uFF080 \u5143\uFF09", free);
+    for (const model of paid) {
       const key = model.company ?? "\u5176\u4ED6";
       const bucket = groups.get(key) ?? [];
       bucket.push(model);
@@ -409,8 +440,9 @@ function SsyModelSelect(props) {
     return [...groups.entries()];
   }, [models, filter]);
   const selected = models.find((m) => m.id === value);
+  const freeCount = models.filter(isFreeModel).length;
   return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "dshc-field", children: [
-    /* @__PURE__ */ (0, import_jsx_runtime.jsx)("label", { className: "dshc-label", children: "\u6A21\u578B\uFF08\u5171 " + String(models.length) + " \u4E2A\uFF0C\u8F93\u5165\u8FC7\u6EE4\uFF09" }),
+    /* @__PURE__ */ (0, import_jsx_runtime.jsx)("label", { className: "dshc-label", children: "\u6A21\u578B\uFF08\u5171 " + String(models.length) + " \u4E2A \xB7 \u514D\u8D39 " + String(freeCount) + " \u4E2A\uFF0C\u8F93\u5165\u8FC7\u6EE4\uFF09" }),
     /* @__PURE__ */ (0, import_jsx_runtime.jsx)(
       "input",
       {
@@ -437,6 +469,7 @@ function SsyModelSelect(props) {
           error === void 0 && models.length === 0 && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", { value: "", children: "\u6A21\u578B\u5217\u8868\u52A0\u8F7D\u4E2D\u2026" }),
           grouped.map(([company, list]) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("optgroup", { label: company, children: list.map((m) => /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("option", { value: m.id, children: [
             m.id,
+            isFreeModel(m) ? " \xB7 \u514D\u8D39" : "",
             m.context_window !== void 0 ? " \xB7 " + String(Math.round(m.context_window / 1e3)) + "k" : ""
           ] }, m.id)) }, company))
         ]
@@ -445,7 +478,7 @@ function SsyModelSelect(props) {
     selected !== void 0 && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", { className: "dshc-hint", children: [
       selected.name ?? selected.id,
       selected.context_window !== void 0 ? " \xB7 \u4E0A\u4E0B\u6587 " + String(selected.context_window) : "",
-      selected.pricing?.input_price !== void 0 ? " \xB7 \xA5" + String(selected.pricing.input_price) + "/\u767E\u4E07\u8F93\u5165" : ""
+      isFreeModel(selected) ? " \xB7 \u514D\u8D39\uFF080 \u5143\uFF09" : selected.pricing?.input_price !== void 0 ? " \xB7 \xA5" + String(selected.pricing.input_price) + "/\u767E\u4E07\u8F93\u5165" : ""
     ] })
   ] });
 }
@@ -458,6 +491,22 @@ function SsyOnboarding(props) {
   const [apiKey, setApiKey] = (0, import_react2.useState)("");
   const [selected, setSelected] = (0, import_react2.useState)(void 0);
   const [error, setError] = (0, import_react2.useState)(void 0);
+  const [loginBusy, setLoginBusy] = (0, import_react2.useState)(false);
+  (0, import_react2.useEffect)(() => listenSsyKey((key) => {
+    setApiKey(key);
+    setError(void 0);
+  }), []);
+  const login = async () => {
+    if (loginBusy) return;
+    setLoginBusy(true);
+    try {
+      await ssyLogin();
+    } catch (err) {
+      setError(String(err instanceof Error ? err.message : err));
+    } finally {
+      setLoginBusy(false);
+    }
+  };
   (0, import_react2.useEffect)(() => {
     let cancelled = false;
     void probeProviders(api).then(
@@ -530,11 +579,24 @@ function SsyOnboarding(props) {
             }
           }
         ),
+        /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(
+          "button",
+          {
+            type: "button",
+            className: "dshc-btn",
+            disabled: loginBusy,
+            onClick: () => {
+              void login();
+            },
+            title: "\u5728\u7CFB\u7EDF\u6D4F\u89C8\u5668\u4E2D\u767B\u5F55\u80DC\u7B97\u4E91\uFF0C\u6388\u6743\u540E API Key \u81EA\u52A8\u586B\u5165\uFF08\u4E5F\u53EF\u624B\u52A8\u7C98\u8D34\uFF09",
+            children: loginBusy ? "\u6253\u5F00\u4E2D\u2026" : "\u767B\u5F55\u80DC\u7B97\u4E91"
+          }
+        ),
         /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("button", { type: "button", className: "dshc-btn ghost", onClick: () => {
           void openExternal(SSY_SIGNUP_URL);
         }, children: "\u83B7\u53D6 API Key" })
       ] }),
-      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("p", { className: "dshc-hint", children: "\u70B9\u51FB\u6309\u94AE\u524D\u5F80\u80DC\u7B97\u4E91\u5B98\u7F51\u6CE8\u518C\u9886\u53D6\uFF08\u6D4F\u89C8\u5668\u6253\u5F00\uFF09\u3002" })
+      /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("p", { className: "dshc-hint", children: "\u300C\u767B\u5F55\u80DC\u7B97\u4E91\u300D\u5728\u6D4F\u89C8\u5668\u4E2D\u6388\u6743\u540E\u81EA\u52A8\u586B\u5165 Key\uFF1B\u4E5F\u53EF\u524D\u5F80\u5B98\u7F51\u6CE8\u518C\u9886\u53D6\u540E\u624B\u52A8\u7C98\u8D34\u3002" })
     ] }),
     /* @__PURE__ */ (0, import_jsx_runtime2.jsx)(SsyModelSelect, { value: selected?.id ?? "", onChange: setSelected, compact: true }),
     error !== void 0 && /* @__PURE__ */ (0, import_jsx_runtime2.jsx)("p", { className: "dshc-error", children: error }),
@@ -963,6 +1025,40 @@ function Loaded({ api }) {
   (0, import_react4.useEffect)(() => {
     void reload();
   }, [reload]);
+  const [account, setAccount] = (0, import_react4.useState)(void 0);
+  const [accountBusy, setAccountBusy] = (0, import_react4.useState)(false);
+  const reloadAccount = (0, import_react4.useCallback)(async () => {
+    if (accountBusy) return;
+    setAccountBusy(true);
+    try {
+      setAccount(await fetchSsyAccount());
+    } catch (err) {
+      setAccount({ ok: false, reason: "api", error: String(err) });
+    } finally {
+      setAccountBusy(false);
+    }
+  }, [accountBusy]);
+  (0, import_react4.useEffect)(() => {
+    if (ssyKeyed === true) void reloadAccount();
+    else setAccount(void 0);
+  }, [ssyKeyed, reloadAccount]);
+  const [loginBusy, setLoginBusy] = (0, import_react4.useState)(false);
+  (0, import_react4.useEffect)(() => listenSsyKey((apiKey) => {
+    setKeyDraft(apiKey);
+    setError(void 0);
+    setSavedNote("\u80DC\u7B97\u4E91\u767B\u5F55\u6210\u529F\uFF1AAPI Key \u5DF2\u81EA\u52A8\u586B\u5165\uFF0C\u9009\u62E9\u6A21\u578B\u540E\u70B9\u4FDD\u5B58\u5373\u53EF\u3002");
+  }), []);
+  const login = async () => {
+    if (loginBusy) return;
+    setLoginBusy(true);
+    try {
+      await ssyLogin();
+    } catch (err) {
+      setError(String(err instanceof Error ? err.message : err));
+    } finally {
+      setLoginBusy(false);
+    }
+  };
   const save = async () => {
     if (busy || incomplete) return;
     setBusy(true);
@@ -990,6 +1086,7 @@ function Loaded({ api }) {
       setKeyDraft("");
       setSavedNote(key !== "" ? "\u5DF2\u4FDD\u5B58\uFF1A\u80DC\u7B97\u4E91\u5DF2\u914D\u7F6E\u5E76\u8BBE\u4E3A\u9ED8\u8BA4\u4F9B\u5E94\u5546" : "\u5DF2\u4FDD\u5B58\uFF1A\u9ED8\u8BA4\u6A21\u578B\u5DF2\u66F4\u65B0");
       await reload();
+      void reloadAccount();
     } catch (err) {
       setError(String(err));
     } finally {
@@ -1089,6 +1186,51 @@ function Loaded({ api }) {
         ssyKeyed === void 0 ? "\u72B6\u6001\u672A\u77E5" : ssyKeyed ? "API Key \u5DF2\u914D\u7F6E" : "API Key \u672A\u914D\u7F6E",
         "\u3000\u9ED8\u8BA4\u6A21\u578B\uFF1A" + defaultModelLabel(defaultModel)
       ] }),
+      ssyKeyed === true && account !== void 0 && account.ok && /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)("p", { className: "dshc-status", children: [
+        "\u3000",
+        account.displayName !== void 0 ? account.displayName + "\u3000" : "",
+        "\u4F59\u989D \xA5" + (account.balance ?? 0).toFixed(2),
+        account.usageTotal !== void 0 && "\u3000\u8FD1" + String(account.usageDays ?? 7) + "\u65E5\u6D88\u8017 \xA5" + account.usageTotal.toFixed(2),
+        account.usage !== void 0 && account.usage.length > 0 && "\uFF08" + String(account.usage.length) + " \u6B21\u8C03\u7528\uFF09",
+        /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(
+          "button",
+          {
+            type: "button",
+            className: "dshc-btn link",
+            style: { padding: "0 4px", fontSize: "11px" },
+            disabled: accountBusy,
+            onClick: () => {
+              void reloadAccount();
+            },
+            children: accountBusy ? "\u5237\u65B0\u4E2D\u2026" : "\u5237\u65B0"
+          }
+        )
+      ] }),
+      ssyKeyed === true && account !== void 0 && !account.ok && account.reason === "api" && /* @__PURE__ */ (0, import_jsx_runtime4.jsx)("p", { className: "dshc-status bad", children: "\u3000\u8D26\u6237\u4FE1\u606F\u83B7\u53D6\u5931\u8D25\uFF1A" + (account.error ?? "\u672A\u77E5\u9519\u8BEF") }),
+      ssyKeyed === true && account?.ok === true && account.usage !== void 0 && account.usage.length > 0 && /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)("details", { style: { margin: "4px 0 8px" }, children: [
+        /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)("summary", { className: "dshc-hint", style: { cursor: "pointer" }, children: [
+          "\u6D88\u8017\u660E\u7EC6\uFF08\u8FD1",
+          String(account.usageDays ?? 7),
+          "\u65E5\uFF0C\u6700\u591A 50 \u6761\uFF09"
+        ] }),
+        /* @__PURE__ */ (0, import_jsx_runtime4.jsx)("ul", { className: "dshc-list", style: { marginTop: 6 }, children: account.usage.map((e, i) => /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)("li", { style: { fontSize: 12, flexWrap: "wrap" }, children: [
+          /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)("span", { className: "dshc-list-main", children: [
+            e.at,
+            /* @__PURE__ */ (0, import_jsx_runtime4.jsx)("span", { className: "dshc-list-sub", children: e.model })
+          ] }),
+          /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)("span", { style: { whiteSpace: "nowrap" }, children: [
+            "\xA5",
+            e.credits.toFixed(4),
+            /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)("span", { className: "dshc-list-sub", children: [
+              "\u3000",
+              String(e.promptTokens),
+              "/",
+              String(e.completionTokens),
+              " tokens"
+            ] })
+          ] })
+        ] }, i)) })
+      ] }),
       /* @__PURE__ */ (0, import_jsx_runtime4.jsxs)("div", { className: "dshc-row", style: { marginTop: 8, marginBottom: 8 }, children: [
         /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(
           "input",
@@ -1100,6 +1242,19 @@ function Loaded({ api }) {
             onChange: (e) => {
               setKeyDraft(e.target.value);
             }
+          }
+        ),
+        ssyKeyed !== true && /* @__PURE__ */ (0, import_jsx_runtime4.jsx)(
+          "button",
+          {
+            type: "button",
+            className: "dshc-btn",
+            disabled: loginBusy,
+            onClick: () => {
+              void login();
+            },
+            title: "\u5728\u7CFB\u7EDF\u6D4F\u89C8\u5668\u4E2D\u767B\u5F55\u80DC\u7B97\u4E91\uFF0C\u6388\u6743\u540E API Key \u81EA\u52A8\u586B\u5165\uFF08\u4E5F\u53EF\u624B\u52A8\u7C98\u8D34\uFF09",
+            children: loginBusy ? "\u6253\u5F00\u4E2D\u2026" : "\u767B\u5F55\u80DC\u7B97\u4E91"
           }
         ),
         /* @__PURE__ */ (0, import_jsx_runtime4.jsx)("button", { type: "button", className: "dshc-btn ghost", onClick: () => {

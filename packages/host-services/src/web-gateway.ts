@@ -14,15 +14,63 @@
  * - POST /dsh-cline/mcp             write the MCP server declarations (file)
  * - POST /dsh-cline/restart         restart the DSH service via the bridge
  * - POST /dsh-cline/ssy-login       start the Shengsuanyun OAuth login (bridge)
+ * - GET  /dsh-cline/ssy-account     balance + recent usage (proxied account API)
  *
  * @module @dsh-cline/host-services/web-gateway
  */
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { dirname, join } from 'node:path'
+import { createRequire } from 'node:module'
 import type { Context, WebServerService } from '@deepseek-ai/cordis'
 import type { VscodeHostService } from './index.js'
 import { mcpConfigFile, validateMcpDocument } from './mcp-loader.js'
+
+/** Shengsuanyun account API base (see the SSYAccountService reference). */
+const SSY_API_BASE = 'https://api.shengsuanyun.com'
+/** Credential reference the Shengsuanyun key is stored under. */
+const SSY_KEY_REF = 'SHENGSUANYUN_API_KEY'
+/** One account fetch budget. */
+const SSY_ACCOUNT_TIMEOUT_MS = 50_000
+
+/**
+ * The stored Shengsuanyun API key from the isolated home's credential
+ * document, or undefined when not configured. The `yaml` package resolves
+ * from the dsh profile at runtime (host-services ships zero deps).
+ */
+function readSsyApiKey(): string | undefined {
+  const home = process.env.DSH_HOME
+  if (home === undefined || home === '') return undefined
+  try {
+    const file = join(home, '.credentials.yaml')
+    const doc = (createRequire(import.meta.url)('yaml') as { parse(text: string): unknown })
+      .parse(readFileSync(file, 'utf8'))
+    if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) return undefined
+    const value = (doc as Record<string, unknown>)[SSY_KEY_REF]
+    return typeof value === 'string' && value !== '' ? value : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** One authenticated GET against the Shengsuanyun account API envelope. */
+async function ssyApiGet<T>(endpoint: string, apiKey: string): Promise<T> {
+  const response = await fetch(SSY_API_BASE + endpoint, {
+    headers: { 'content-type': 'application/json', 'x-token': apiKey },
+    signal: AbortSignal.timeout(SSY_ACCOUNT_TIMEOUT_MS),
+  })
+  const body = await response.json() as { code?: unknown, data?: unknown }
+  if (body === null || typeof body !== 'object' || body.data === undefined || body.code === 103) {
+    throw new Error('invalid response from ' + endpoint)
+  }
+  return body.data as T
+}
+
+/** yyyy-mm-dd for `daysAgo` (the usage log's date range params). */
+function ssyDate(daysAgo: number): string {
+  const d = new Date(Date.now() - daysAgo * 24 * 60 * 60 * 1000)
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0')
+}
 
 /** Shengsuanyun OpenAI-compatible model catalog; public, no auth required. */
 const MODELS_URL = 'https://router.shengsuanyun.com/api/v1/models/'
@@ -263,4 +311,61 @@ export function registerWebGateway(
       }
     },
   }), 'dsh-cline-host-services: ssy-login route')
+
+  // Shengsuanyun account balance + recent usage (mirrors the reference
+  // SSYAccountService): the browser half cannot reach api.shengsuanyun.com
+  // (CORS), so this route reads the stored key from the isolated home's
+  // credential document and proxies /user/info, /base/rate and
+  // /modelrouter/userlog, composing one compact payload for the models page.
+  ctx.effect(() => webServer.register({
+    kind: 'exact',
+    path: '/dsh-cline/ssy-account',
+    handler: async (req, res) => {
+      if (req.method !== 'GET') {
+        res.writeHead(405).end()
+        return
+      }
+      const apiKey = readSsyApiKey()
+      if (apiKey === undefined) {
+        sendJson(res, 200, { ok: false, reason: 'no-key' })
+        return
+      }
+      try {
+        const range = 'startDate=' + ssyDate(7) + '&endDate=' + ssyDate(0)
+        const [info, rate, usage] = await Promise.all([
+          ssyApiGet<{ Nickname?: unknown, Username?: unknown, Wallet?: { Assets?: unknown } }>('/user/info', apiKey),
+          ssyApiGet<number>('/base/rate', apiKey),
+          ssyApiGet<{ logs?: Array<{ request_time?: unknown, model?: { company?: unknown, name?: unknown }, total_amount?: unknown, input_tokens?: unknown, output_tokens?: unknown }> }>(
+            '/modelrouter/userlog?page=1&pageSize=1000&' + range, apiKey),
+        ])
+        const rateNumber = typeof rate === 'number' ? rate : Number(rate)
+        const logs = Array.isArray(usage?.logs) ? usage.logs : []
+        const entries = logs.map(log => {
+          const model = log.model !== null && typeof log.model === 'object' ? log.model : undefined
+          const amount = Number(log.total_amount ?? 0)
+          return {
+            at: typeof log.request_time === 'string' ? log.request_time : '',
+            model: [model?.company, model?.name].filter(v => typeof v === 'string' && v !== '').join('/'),
+            // The reference's formula: credits = rate * total_amount / 1e7.
+            credits: Number.isFinite(rateNumber) ? (rateNumber * amount) / 10_000_000 : 0,
+            promptTokens: Number(log.input_tokens ?? 0),
+            completionTokens: Number(log.output_tokens ?? 0),
+          }
+        })
+        const assets = Number(info?.Wallet?.Assets ?? NaN)
+        sendJson(res, 200, {
+          ok: true,
+          displayName: typeof info?.Nickname === 'string' && info.Nickname !== ''
+            ? info.Nickname
+            : typeof info?.Username === 'string' ? info.Username : undefined,
+          balance: Number.isFinite(assets) ? assets / 10_000 : undefined,
+          usageDays: 7,
+          usageTotal: entries.reduce((sum, e) => sum + e.credits, 0),
+          usage: entries.slice(0, 50),
+        })
+      } catch (err: unknown) {
+        sendJson(res, 200, { ok: false, reason: 'api', error: String(err) })
+      }
+    },
+  }), 'dsh-cline-host-services: ssy-account route')
 }

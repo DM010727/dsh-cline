@@ -21,6 +21,27 @@ export interface SsyModelSelectProps {
 }
 
 /**
+ * Catalog rows whose zero pricing does NOT mean free (e.g. a promo or
+ * mispriced listing the platform does not treat as free).
+ */
+const NOT_FREE_IDS = new Set(['deepseek/deepseek-v3.1-think'])
+
+/**
+ * Whether a catalog row is free: every price component is zero. The catalog's
+ * own pricing is authoritative (e.g. qwen3.5-4b, 书生 intern 系列, agnes flash,
+ * 快手 kat-coder 系列 — and anything Shengsuanyun marks free later).
+ */
+function isFreeModel(model: SsyModel): boolean {
+  if (NOT_FREE_IDS.has(model.id)) return false
+  const p = model.pricing
+  if (p === undefined) return false
+  return Number(p.price) === 0
+    && Number(p.input_price) === 0
+    && Number(p.output_price) === 0
+    && Number(p.cached_price ?? p.price) === 0
+}
+
+/**
  * Filter + grouped catalog select + selected-model detail line.
  * @returns the picker element tree.
  */
@@ -46,8 +67,13 @@ export function SsyModelSelect(props: SsyModelSelectProps): ReactNode {
       || m.id.toLowerCase().includes(needle)
       || (m.name ?? '').toLowerCase().includes(needle)
       || (m.company ?? '').toLowerCase().includes(needle))
+    // Free models get their own head group (they are also excluded from the
+    // per-company groups so nothing is listed twice).
+    const free = matched.filter(isFreeModel)
+    const paid = matched.filter(m => !isFreeModel(m))
     const groups = new Map<string, SsyModel[]>()
-    for (const model of matched) {
+    if (free.length > 0) groups.set('免费模型（0 元）', free)
+    for (const model of paid) {
       const key = model.company ?? '其他'
       const bucket = groups.get(key) ?? []
       bucket.push(model)
@@ -57,11 +83,12 @@ export function SsyModelSelect(props: SsyModelSelectProps): ReactNode {
   }, [models, filter])
 
   const selected = models.find(m => m.id === value)
+  const freeCount = models.filter(isFreeModel).length
 
   return (
     <div className="dshc-field">
       <label className="dshc-label">
-        {'模型（共 ' + String(models.length) + ' 个，输入过滤）'}
+        {'模型（共 ' + String(models.length) + ' 个 · 免费 ' + String(freeCount) + ' 个，输入过滤）'}
       </label>
       <input
         className="dshc-input dshc-model-filter"
@@ -85,6 +112,7 @@ export function SsyModelSelect(props: SsyModelSelectProps): ReactNode {
             {list.map(m => (
               <option key={m.id} value={m.id}>
                 {m.id}
+                {isFreeModel(m) ? ' · 免费' : ''}
                 {m.context_window !== undefined ? ' · ' + String(Math.round(m.context_window / 1000)) + 'k' : ''}
               </option>
             ))}
@@ -95,9 +123,11 @@ export function SsyModelSelect(props: SsyModelSelectProps): ReactNode {
         <p className="dshc-hint">
           {selected.name ?? selected.id}
           {selected.context_window !== undefined ? ' · 上下文 ' + String(selected.context_window) : ''}
-          {selected.pricing?.input_price !== undefined
-            ? ' · ¥' + String(selected.pricing.input_price) + '/百万输入'
-            : ''}
+          {isFreeModel(selected)
+            ? ' · 免费（0 元）'
+            : selected.pricing?.input_price !== undefined
+              ? ' · ¥' + String(selected.pricing.input_price) + '/百万输入'
+              : ''}
         </p>
       )}
     </div>

@@ -629,7 +629,10 @@ function portOf(url: string): string {
 async function handleSsyCallback(uri: vscode.Uri, view: DshClineView, channel: vscode.OutputChannel): Promise<void> {
   const path = uri.path.replace(/\/+$/, '')
   if (path !== '/ssy' && path !== '/shengsuanyun') return
-  const code = new URL(uri.query ?? '', 'https://x').searchParams.get('code')
+  // vscode.Uri.query has NO leading '?': without prepending one, URL() parses
+  // 'code=...' as a PATH and searchParams.get('code') is always null - which
+  // is exactly the「回调缺少 code 参数」users hit.
+  const code = new URL('?' + (uri.query ?? ''), 'https://x').searchParams.get('code')
   if (code === null || code === '') {
     void vscode.window.showErrorMessage('胜算云登录回调缺少 code 参数')
     return

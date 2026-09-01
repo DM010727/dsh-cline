@@ -13,6 +13,8 @@
  * - GET  /dsh-cline/mcp             read the MCP server declarations (file)
  * - POST /dsh-cline/mcp             write the MCP server declarations (file)
  * - POST /dsh-cline/restart         restart the DSH service via the bridge
+ * - POST /dsh-cline/ssy-login       start the Shengsuanyun OAuth login (bridge)
+ * - GET  /dsh-cline/ssy-account     balance + recent usage (proxied account API)
  *
  * @module @dsh-cline/host-services/web-gateway
  */

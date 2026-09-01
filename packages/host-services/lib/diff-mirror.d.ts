@@ -8,6 +8,13 @@
  * a virtual doc on the right that sweeps the change in) BEFORE the write lands.
  * So the change is visible as DSH is about to apply it, not after it finished.
  *
+ * The pre-write file content is captured HERE, synchronously, before `next()`
+ * releases the tool body. The bridge call itself is fire-and-forget — if the
+ * extension read the disk itself, the write could land first and the "original"
+ * would be the post-write content, making the diff blank (write) or failing to
+ * compute (edit: old_string already replaced). Shipping the snapshot with the
+ * payload eliminates that race without blocking the tool.
+ *
  * `tools/pre-execute` is a CORDIS WATERFALL: each listener is called as
  * `(exec, next)` and a listener that does NOT call `next()` VETOES the rest of
  * the chain (including the native allow gate). So the begin side effect must be

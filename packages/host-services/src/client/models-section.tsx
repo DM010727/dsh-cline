@@ -16,9 +16,9 @@ import type { ReactNode } from 'react'
 import type { IApiClient } from '@deepseek-ai/dsh-api-remotes/client'
 import { SsyModelSelect } from './ssy-models.tsx'
 import {
-  declareCustomProvider, listenSsyKey, openExternal, probeProviders, readDefaultModel, readProviderRows,
-  removeProviderRow, saveProviderKey, saveSsyModel, saveSsySetup, ssyLogin, SSY_SIGNUP_URL,
-  type DefaultModel, type ProviderRowView, type SsyModel,
+  declareCustomProvider, fetchSsyAccount, listenSsyKey, openExternal, probeProviders, readDefaultModel,
+  readProviderRows, removeProviderRow, saveProviderKey, saveSsyModel, saveSsySetup, ssyLogin, SSY_SIGNUP_URL,
+  type DefaultModel, type ProviderRowView, type SsyAccount, type SsyModel,
 } from './shared.ts'
 
 /** Face the registration injects. */
@@ -106,6 +106,26 @@ function Loaded({ api }: { api: IApiClient }): ReactNode {
 
   useEffect(() => { void reload() }, [reload])
 
+  // Account balance + recent usage (gateway-proxied Shengsuanyun account API):
+  // fetched when a key is known and after each save (a new key changes it).
+  const [account, setAccount] = useState<SsyAccount | undefined>(undefined)
+  const [accountBusy, setAccountBusy] = useState(false)
+  const reloadAccount = useCallback(async (): Promise<void> => {
+    if (accountBusy) return
+    setAccountBusy(true)
+    try {
+      setAccount(await fetchSsyAccount())
+    } catch (err: unknown) {
+      setAccount({ ok: false, reason: 'api', error: String(err) })
+    } finally {
+      setAccountBusy(false)
+    }
+  }, [accountBusy])
+  useEffect(() => {
+    if (ssyKeyed === true) void reloadAccount()
+    else setAccount(undefined)
+  }, [ssyKeyed, reloadAccount])
+
   // Shengsuanyun OAuth login (ported from cline-Chinese): a key exchanged after
   // the browser flow lands here through the shell relay and fills the field,
   // exactly like a manual paste - the user then picks the model and saves.
@@ -154,6 +174,7 @@ function Loaded({ api }: { api: IApiClient }): ReactNode {
       setKeyDraft('')
       setSavedNote(key !== '' ? '已保存：胜算云已配置并设为默认供应商' : '已保存：默认模型已更新')
       await reload()
+      void reloadAccount()
     } catch (err) {
       setError(String(err))
     } finally {
@@ -262,6 +283,46 @@ function Loaded({ api }: { api: IApiClient }): ReactNode {
           {ssyKeyed === undefined ? '状态未知' : ssyKeyed ? 'API Key 已配置' : 'API Key 未配置'}
           {'　默认模型：' + defaultModelLabel(defaultModel)}
         </p>
+        {ssyKeyed === true && account !== undefined && account.ok && (
+          <p className="dshc-status">
+            {'　'}
+            {account.displayName !== undefined ? account.displayName + '　' : ''}
+            {'余额 ¥' + (account.balance ?? 0).toFixed(2)}
+            {account.usageTotal !== undefined && '　近' + String(account.usageDays ?? 7) + '日消耗 ¥' + account.usageTotal.toFixed(2)}
+            {account.usage !== undefined && account.usage.length > 0 && '（' + String(account.usage.length) + ' 次调用）'}
+            <button
+              type="button"
+              className="dshc-btn link"
+              style={{ padding: '0 4px', fontSize: '11px' }}
+              disabled={accountBusy}
+              onClick={() => { void reloadAccount() }}
+            >
+              {accountBusy ? '刷新中…' : '刷新'}
+            </button>
+          </p>
+        )}
+        {ssyKeyed === true && account !== undefined && !account.ok && account.reason === 'api' && (
+          <p className="dshc-status bad">{'　账户信息获取失败：' + (account.error ?? '未知错误')}</p>
+        )}
+        {ssyKeyed === true && account?.ok === true && account.usage !== undefined && account.usage.length > 0 && (
+          <details style={{ margin: '4px 0 8px' }}>
+            <summary className="dshc-hint" style={{ cursor: 'pointer' }}>消耗明细（近{String(account.usageDays ?? 7)}日，最多 50 条）</summary>
+            <ul className="dshc-list" style={{ marginTop: 6 }}>
+              {account.usage.map((e, i) => (
+                <li key={i} style={{ fontSize: 12, flexWrap: 'wrap' }}>
+                  <span className="dshc-list-main">
+                    {e.at}
+                    <span className="dshc-list-sub">{e.model}</span>
+                  </span>
+                  <span style={{ whiteSpace: 'nowrap' }}>
+                    ¥{e.credits.toFixed(4)}
+                    <span className="dshc-list-sub">{'　'}{String(e.promptTokens)}/{String(e.completionTokens)} tokens</span>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </details>
+        )}
         <div className="dshc-row" style={{ marginTop: 8, marginBottom: 8 }}>
           <input
             className="dshc-input"

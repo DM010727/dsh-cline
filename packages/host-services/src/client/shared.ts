@@ -70,7 +70,14 @@ export interface SsyModel {
   context_window?: number
   max_tokens?: number
   support_apis?: string[]
-  pricing?: { input_price?: number; output_price?: number; currency?: string }
+  pricing?: {
+    price?: number
+    input_price?: number
+    output_price?: number
+    cached_price?: number
+    image_price?: number
+    currency?: string
+  }
 }
 
 /**
@@ -116,6 +123,25 @@ export async function openExternal(url: string): Promise<void> {
 export async function ssyLogin(): Promise<void> {
   const response = await fetch('/dsh-cline/ssy-login', { method: 'POST' })
   if (!response.ok) throw new Error('发起胜算云登录失败（HTTP ' + String(response.status) + '）')
+}
+
+/** Account balance + recent usage from the gateway's proxied account API. */
+export interface SsyAccount {
+  ok: boolean
+  reason?: 'no-key' | 'api'
+  error?: string
+  displayName?: string
+  balance?: number
+  usageDays?: number
+  usageTotal?: number
+  usage?: Array<{ at: string, model: string, credits: number, promptTokens: number, completionTokens: number }>
+}
+
+/** Fetch the Shengsuanyun account balance and recent usage through the gateway. */
+export async function fetchSsyAccount(): Promise<SsyAccount> {
+  const response = await fetch('/dsh-cline/ssy-account')
+  if (!response.ok) throw new Error('获取胜算云账户信息失败（HTTP ' + String(response.status) + '）')
+  return await response.json() as SsyAccount
 }
 
 /**
