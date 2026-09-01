@@ -144,6 +144,12 @@ export class SidecarManager extends EventEmitter {
       // every few seconds, which reads as the panel endlessly refreshing).
       let discovered: string[] = []
       let discoveredAt = 0
+      // Squatter detection: a listener that never serves the GUI within this
+      // window after OUR launch is a leftover process holding the port (the
+      // fresh `dsh web` died on EADDRINUSE in the terminal). Fail fast with
+      // the recovery command instead of riding out the whole start timeout.
+      const SQUATTER_MS = 30_000
+      let squatterSince: number | undefined
       while (Date.now() < deadline) {
         await delay(POLL_MS)
         if (gen !== this.gen) throw new Error('superseded')
@@ -152,13 +158,30 @@ export class SidecarManager extends EventEmitter {
         if (this.host !== undefined && !this.host.alive()) {
           throw new Error('DSH 启动失败：「DSH Cline 服务」终端已被关闭。请重试，并保持该终端开启。')
         }
+        if (await this.carrierUp(url)) {
+          if (squatterSince === undefined) squatterSince = Date.now()
+          if (Date.now() - squatterSince >= SQUATTER_MS) {
+            throw new Error('端口 ' + url + ' 被一个无响应的残留进程占用（新启动的 dsh web 已因端口冲突退出，'
+              + '详见「DSH Cline 服务」终端）。请执行命令面板中的「DSH Cline: 清理残留 DSH 进程」后重试。')
+          }
+        } else {
+          squatterSince = undefined
+        }
         if (this.host?.discoverUrls !== undefined && Date.now() - discoveredAt >= DISCOVER_EVERY_MS) {
           discoveredAt = Date.now()
           discovered = await this.host.discoverUrls()
         }
         for (const candidate of discovered) {
           if (candidate === url) continue
-          if (await this.probe(candidate)) return this.settleReady(gen, candidate, 'bind')
+          // Only bind DISCOVERED instances that are OURS: the candidate must
+          // serve /dsh-cline/health (mounted by the host-services plugin). A
+          // foreign `dsh web` (user's own ~/.dsh home, no plugin, no bridge)
+          // answers 404 there - binding it left the panel on a DSH whose
+          // DSH-Cline features were all dead. The CONFIGURED port keeps its
+          // plain bind: an instance there was started on our port on purpose.
+          if (await this.probe(candidate) && await this.probeOurs(candidate)) {
+            return this.settleReady(gen, candidate, 'bind')
+          }
         }
       }
       throw new Error('DSH ' + (START_TIMEOUT_MS / 1000) + 's 内未就绪（探测 ' + url
@@ -297,6 +320,27 @@ export class SidecarManager extends EventEmitter {
           && /^text\/html/.test(String(res.headers['content-type'] ?? ''))
         res.resume()
         resolve(ok)
+      })
+      req.on('error', () => resolve(false))
+      req.setTimeout(PROBE_TIMEOUT_MS, () => {
+        req.destroy()
+        resolve(false)
+      })
+    })
+  }
+
+  /**
+   * Whether the instance at `url` carries OUR host-services plugin: it serves
+   * `/dsh-cline/health` (200 with the bridge up, 502 with it down - either
+   * proves the route exists). A foreign `dsh web` 404s there, so discovered
+   * candidates are only bound when this passes.
+   */
+  private probeOurs(url: string): Promise<boolean> {
+    return new Promise<boolean>(resolve => {
+      const req = http.get(url + '/dsh-cline/health', res => {
+        const status = res.statusCode ?? 0
+        res.resume()
+        resolve(status !== 404 && status !== 0)
       })
       req.on('error', () => resolve(false))
       req.setTimeout(PROBE_TIMEOUT_MS, () => {

@@ -2,7 +2,7 @@
   "name": "cline-shengsuan",
   "displayName": "DSH Cline",
   "description": "Open-source DeepSeek Harness + Cline VS Code extension (agent, live diff, MCP)",
-  "version": "4.2.0",
+  "version": "4.2.1",
   "license": "MIT",
   "publisher": "shengsuan-cloud",
   "private": false,
@@ -98,6 +98,11 @@
       {
         "command": "dsh-cline.showLastDiff",
         "title": "重新打开最近一次变更 diff",
+        "category": "DSH Cline"
+      },
+      {
+        "command": "dsh-cline.cleanupDshProcesses",
+        "title": "清理残留 DSH 进程...",
         "category": "DSH Cline"
       }
     ],

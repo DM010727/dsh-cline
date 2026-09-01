@@ -497,6 +497,69 @@ export function activate(context: vscode.ExtensionContext): Promise<void> {
         if (!shown) void vscode.window.showInformationMessage('还没有可显示的 DSH 变更')
       })
     }),
+    vscode.commands.registerCommand('dsh-cline.cleanupDshProcesses', async () => {
+      // Recovery for EADDRINUSE-bricked machines: bare `dsh web` defaults to
+      // port 3080 and Windows keeps the process alive after its terminal
+      // closes, so a leftover instance blocks every later launch (DSH Cline's
+      // own port can be squatted the same way). Enumerate the live `dsh web`
+      // node processes, let the user pick, kill, then revive our sidecar.
+      let stdout = ''
+      try {
+        if (process.platform === 'win32') {
+          const result = await execFile('powershell.exe', ['-NoProfile', '-Command',
+            "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | Where-Object { $_.CommandLine -match 'dsh.+web' } | ForEach-Object { \"$($_.ProcessId)|$($_.CommandLine)\" }"],
+            { windowsHide: true, timeout: 8_000 })
+          stdout = result.stdout
+        } else {
+          const result = await execFile('sh', ['-lc',
+            "ps -eo pid,command | grep -E 'dsh.+web' | grep -v grep || true"])
+          stdout = result.stdout
+        }
+      } catch (err: unknown) {
+        void vscode.window.showErrorMessage('枚举 DSH 进程失败：' + String(err))
+        return
+      }
+      const entries: Array<{ pid: number, port: string, detail: string }> = []
+      for (const line of stdout.split(/\r?\n/)) {
+        const trimmed = line.trim()
+        if (trimmed === '') continue
+        const [pidRaw, ...rest] = process.platform === 'win32' ? trimmed.split('|') : trimmed.split(/\s+/)
+        const pid = Number(pidRaw)
+        const cmd = rest.join(' ')
+        if (!Number.isInteger(pid) || pid <= 0 || !/dsh.+web/.test(cmd)) continue
+        const port = /--port[= ](\d+)/.exec(cmd)?.[1] ?? '3080(默认)'
+        entries.push({ pid, port, detail: cmd.replace(/^.*bin\.js\s*/, '') })
+      }
+      if (entries.length === 0) {
+        void vscode.window.showInformationMessage('没有发现运行中的 dsh web 进程。')
+        return
+      }
+      const picks = await vscode.window.showQuickPick(
+        entries.map(e => ({
+          label: `PID ${String(e.pid)} · 端口 ${e.port}`,
+          description: e.detail,
+          pid: e.pid,
+        })),
+        { canPickMany: true, placeHolder: '选择要结束的残留 dsh web 进程（可多选；本扩展自己的服务也会被结束并自动重启）' },
+      )
+      if (picks === undefined || picks.length === 0) return
+      let killed = 0
+      for (const pick of picks) {
+        try {
+          if (process.platform === 'win32') await execFile('taskkill', ['/F', '/PID', String(pick.pid)], { windowsHide: true })
+          else await execFile('kill', ['-9', String(pick.pid)])
+          killed++
+        } catch (err: unknown) {
+          channel.appendLine('[cleanup] kill ' + String(pick.pid) + ' failed: ' + String(err))
+        }
+      }
+      void vscode.window.showInformationMessage('已结束 ' + String(killed) + '/' + String(picks.length) + ' 个 DSH 进程，正在重启 DSH 服务…')
+      sidecar.stop()
+      void sidecar.restart().then(
+        url => vscode.window.showInformationMessage('DSH 服务已就绪：' + url),
+        (err: unknown) => vscode.window.showErrorMessage('DSH 服务重启失败：' + String(err)),
+      )
+    }),
     vscode.commands.registerCommand('dsh-cline.explainCode', () => runSelectionAction('explain')),
     vscode.commands.registerCommand('dsh-cline.improveCode', () => runSelectionAction('improve')),
     // Cline-style lightbulb: offer add/explain/improve as code actions on any
