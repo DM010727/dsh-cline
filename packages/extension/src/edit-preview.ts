@@ -288,6 +288,7 @@ async function animate(rightUri: vscode.Uri, left: string, right: string): Promi
  * cosmetic failure: the edit proceeds without a preview. Returns the opened path.
  */
 export async function openEditPreview(req: EditPreviewRequest): Promise<string> {
+  lastPreview = { ...req }
   const path = req.path
   const previewId = nextPreviewId++
   const leftUri = vscode.Uri.parse(`${EDIT_URI_SCHEME}:${path}`).with({ query: `preview-${previewId}-left` })
@@ -310,4 +311,14 @@ export async function openEditPreview(req: EditPreviewRequest): Promise<string> 
     vscode.window.showInformationMessage('DSH 变更预览动画失败: ' + String(err))
   })
   return path
+}
+
+/** The most recent preview, so a diff the user closed can be re-opened. */
+let lastPreview: EditPreviewRequest | undefined
+
+/** Re-open the most recent edit preview (fresh tab, full animation). */
+export async function reopenLastEditPreview(): Promise<boolean> {
+  if (lastPreview === undefined) return false
+  await openEditPreview(lastPreview)
+  return true
 }

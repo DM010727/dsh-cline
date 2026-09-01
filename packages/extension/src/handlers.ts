@@ -48,7 +48,7 @@ export function registerHandlers(bridge: BridgeServer, extensionVersion: string,
   // from the tool input, and opens a diff whose right side sweeps the change in — so
   // the user sees it "written" as DSH is about to apply it, not after the fact.
   bridge.handle('vscode.diff.begin', async args => {
-    const [payload] = args as [{ tool?: unknown; args?: unknown }]
+    const [payload] = args as [{ tool?: unknown; args?: unknown; original?: unknown }]
     const tool = payload === null || typeof payload !== 'object' ? undefined : payload.tool
     const toolArgs = payload === null || typeof payload !== 'object' ? undefined : payload.args
     if (typeof tool !== 'string' || tool === '') throw new Error('tool is required')
@@ -56,10 +56,19 @@ export function registerHandlers(bridge: BridgeServer, extensionVersion: string,
     const rawPath = target === undefined ? undefined : (target.file_path ?? target.path)
     if (typeof rawPath !== 'string' || rawPath === '') throw new Error('file path is required')
     const uri = resolvePath(rawPath)
-    let original = ''
-    try {
-      original = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8')
-    } catch { /* new file: diff against empty */ }
+    // The host side snapshots the PRE-WRITE content synchronously before the
+    // write is released (racing the write extension-side can observe post-write
+    // content: a blank diff for `write`, a failed compute for `edit`). An
+    // undefined snapshot falls back to reading the disk here.
+    let original: string
+    if (typeof payload?.original === 'string') {
+      original = payload.original
+    } else {
+      original = ''
+      try {
+        original = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8')
+      } catch { /* new file: diff against empty */ }
+    }
     const computed = computeNewContent(tool, original, target ?? {})
     if (!computed.ok) throw new Error(computed.error ?? 'cannot preview this edit')
     await openEditPreview({ path: uri.fsPath, leftContent: original, rightContent: computed.content })

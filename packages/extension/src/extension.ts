@@ -10,7 +10,7 @@ import { SidecarManager } from './sidecar'
 import { DshClineView } from './view'
 import { BridgeServer } from './bridge'
 import { registerHandlers } from './handlers'
-import { editPreviewContentProvider, EDIT_URI_SCHEME } from './edit-preview'
+import { editPreviewContentProvider, EDIT_URI_SCHEME, reopenLastEditPreview } from './edit-preview'
 import { getSelectionContext, buildTaskPrompt, sendTask } from './selection-actions'
 import { ensurePluginInstalled, dshClineHome } from './plugin-install'
 import type { RuntimeStatus, DshVia } from '@dsh-cline/protocol'
@@ -480,6 +480,11 @@ export function activate(context: vscode.ExtensionContext): Promise<void> {
       )
     }),
     vscode.commands.registerCommand('dsh-cline.addToChat', () => runSelectionAction('add')),
+    vscode.commands.registerCommand('dsh-cline.showLastDiff', () => {
+      void reopenLastEditPreview().then(shown => {
+        if (!shown) void vscode.window.showInformationMessage('还没有可显示的 DSH 变更')
+      })
+    }),
     vscode.commands.registerCommand('dsh-cline.explainCode', () => runSelectionAction('explain')),
     vscode.commands.registerCommand('dsh-cline.improveCode', () => runSelectionAction('improve')),
     // Cline-style lightbulb: offer add/explain/improve as code actions on any

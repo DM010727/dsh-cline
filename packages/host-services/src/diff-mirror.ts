@@ -8,6 +8,13 @@
  * a virtual doc on the right that sweeps the change in) BEFORE the write lands.
  * So the change is visible as DSH is about to apply it, not after it finished.
  *
+ * The pre-write file content is captured HERE, synchronously, before `next()`
+ * releases the tool body. The bridge call itself is fire-and-forget — if the
+ * extension read the disk itself, the write could land first and the "original"
+ * would be the post-write content, making the diff blank (write) or failing to
+ * compute (edit: old_string already replaced). Shipping the snapshot with the
+ * payload eliminates that race without blocking the tool.
+ *
  * `tools/pre-execute` is a CORDIS WATERFALL: each listener is called as
  * `(exec, next)` and a listener that does NOT call `next()` VETOES the rest of
  * the chain (including the native allow gate). So the begin side effect must be
@@ -20,6 +27,7 @@
  * @module @dsh-cline/host-services/diff-mirror
  */
 
+import { readFileSync } from 'node:fs'
 import type { Context } from '@deepseek-ai/cordis'
 import type { VscodeHostService } from './index.ts'
 
@@ -33,6 +41,9 @@ interface ExecLike {
   name?: unknown
   arguments?: unknown
 }
+
+/** Cap the snapshot size forwarded over the bridge (oversized files skip the preview). */
+const MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024
 
 /**
  * Register the pre-write diff mirror. Every file-editing tool call opens a diff
@@ -56,7 +67,8 @@ export function registerDiffMirror(ctx: Context, vscodeHost: VscodeHostService):
   events.on('tools/pre-execute', hookPreExecute as (...args: any[]) => any, { prepend: true })
 }
 
-/** Forward an edit-tool execution to the extension to open a pre-write preview. */
+/** Snapshot the pre-write content synchronously, then forward the edit-tool
+ * execution (with that snapshot) to the extension to open a pre-write preview. */
 function begin(exec: ExecLike | undefined, vscodeHost: VscodeHostService, ctx: Context): void {
   const tool = exec === null || typeof exec !== 'object' ? undefined : exec.name
   const args = exec === null || typeof exec !== 'object' ? undefined : exec.arguments
@@ -64,7 +76,25 @@ function begin(exec: ExecLike | undefined, vscodeHost: VscodeHostService, ctx: C
   if (args === null || typeof args !== 'object') return
   const rawPath = (args as Record<string, unknown>).file_path ?? (args as Record<string, unknown>).path
   if (typeof rawPath !== 'string' || rawPath === '') return
-  vscodeHost.call('vscode.diff', 'begin', [{ tool, args }]).catch((err: unknown) => {
+
+  // Capture the ORIGINAL content now, before next() releases the write. This
+  // must be synchronous: an async read (or an extension-side read over the
+  // bridge) races the tool's own write and can observe post-write content.
+  // `original: undefined` tells the extension to read the disk itself (the
+  // legacy path, kept for resolutions this process cannot see); '' means a
+  // genuinely new file — only the create-style tools may treat ENOENT as new,
+  // an `edit` hitting ENOENT here means the path resolved elsewhere.
+  const mayCreate = tool === 'write' || (tool === 'str_replace_editor' && (args as Record<string, unknown>).command === 'create')
+  let original: string | undefined
+  try {
+    const buf = readFileSync(rawPath)
+    original = buf.length <= MAX_SNAPSHOT_BYTES ? buf.toString('utf8') : undefined
+  } catch (err: unknown) {
+    const code = (err as { code?: unknown }).code
+    if (code === 'ENOENT' && mayCreate) original = ''
+  }
+
+  vscodeHost.call('vscode.diff', 'begin', [{ tool, args, original }]).catch((err: unknown) => {
     ctx.logger.warn('diff-mirror begin skipped: ' + String(err))
   })
 }
