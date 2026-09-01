@@ -160,9 +160,10 @@ export function buildGuideHtml(rt: RuntimeStatus, version = ''): string {
     ]))
     steps.push(step('2', '安装 DSH / Install DSH', '装好 Node 后回到本页点击安装。', []))
   } else {
-    steps.push(step('1', '全局安装 DSH / Install DSH globally', '点击按钮，扩展会在 VS Code 终端中自动执行（全程可见，约 282MB）：', [
+    steps.push(step('1', '全局安装 DSH / Install DSH globally', '点击按钮，扩展会在 VS Code 终端中自动执行（全程可见，约 282MB）。无法访问 npmjs.org（未翻墙）请点第二个按钮走国内镜像：', [
       '<button data-act="install">一键全局安装 DSH</button>',
-      '<span class="hint">npm config set allow-scripts … --location=user<br>npm install -g @deepseek-ai/dsh</span>',
+      '<button class="ghost" data-act="install-mirror">国内镜像安装（未翻墙）</button>',
+      '<span class="hint">npm config set allow-scripts … --location=user<br>npm install -g @deepseek-ai/dsh@…<br>镜像版附加：--registry=https://registry.npmmirror.com</span>',
     ]))
   }
   steps.push(step(rt.node ? '2' : '3', '重新检测并启动 / Verify & start', '安装完成后（终端出现新的提示符即完成），点击检测：', [

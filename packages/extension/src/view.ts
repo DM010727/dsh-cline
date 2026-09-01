@@ -6,8 +6,8 @@ import { buildShellHtml, buildGuideHtml, buildStartingHtml } from './shell'
 /** Terminal-backed actions the onboarding guide page can trigger. */
 export interface GuideActions {
   getRuntime(): Promise<RuntimeStatus>
-  /** Open a visible terminal and run the global dsh install commands. */
-  installDsh(): void
+  /** Open a visible terminal and run the global dsh install commands (npmmirror when useMirror). */
+  installDsh(useMirror: boolean): void
   /** Open a visible terminal and install Node.js via winget. */
   installNode(): void
   /** Open the Node.js download page in the browser. */
@@ -111,7 +111,7 @@ export class DshClineView implements vscode.WebviewViewProvider, vscode.Disposab
     webview.onDidReceiveMessage(
       (msg: unknown) => {
         if (isGuideMessage(msg)) {
-          if (msg.type === 'install') this.actions.installDsh()
+          if (msg.type === 'install' || msg.type === 'install-mirror') this.actions.installDsh(msg.type === 'install-mirror')
           else if (msg.type === 'install-node') this.actions.installNode()
           else if (msg.type === 'open-node-page') this.actions.openNodePage()
           else if (msg.type === 'show-terminal') this.actions.showTerminal()

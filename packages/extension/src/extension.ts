@@ -131,10 +131,15 @@ async function getRuntimeStatus(): Promise<RuntimeStatus> {
 }
 
 /** Commands the guide page's install button sends to the terminal. */
-function dshInstallLines(): string[] {
+function dshInstallLines(useMirror = false): string[] {
   return [
     'npm config set allow-scripts ' + ALLOW_SCRIPTS_PKGS + ' --location=user',
-    'npm install -g @deepseek-ai/dsh@' + DSH_VERSION,
+    // The one-shot --registry flag only affects THIS install: users behind the
+    // GFW often cannot reach registry.npmjs.org at all, and the npmmirror
+    // mirror serves the same package domestically. Not persisted to npm
+    // config, so nothing else on the machine changes.
+    'npm install -g @deepseek-ai/dsh@' + DSH_VERSION
+    + (useMirror ? ' --registry=https://registry.npmmirror.com' : ''),
   ]
 }
 
@@ -374,7 +379,7 @@ export function activate(context: vscode.ExtensionContext): Promise<void> {
 
   const view = new DshClineView(sidecar, {
     getRuntime: getRuntimeStatus,
-    installDsh: () => runGuidedInstall(dshInstallLines()),
+    installDsh: (useMirror: boolean) => runGuidedInstall(dshInstallLines(useMirror)),
     installNode: () => runGuidedInstall(['winget install OpenJS.NodeJS.LTS']),
     openNodePage: () => void vscode.env.openExternal(vscode.Uri.parse('https://nodejs.org/')),
     showTerminal: () => serviceTerminal().show(true),
