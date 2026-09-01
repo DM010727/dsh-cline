@@ -13,6 +13,7 @@
  * - GET  /dsh-cline/mcp             read the MCP server declarations (file)
  * - POST /dsh-cline/mcp             write the MCP server declarations (file)
  * - POST /dsh-cline/restart         restart the DSH service via the bridge
+ * - POST /dsh-cline/ssy-login       start the Shengsuanyun OAuth login (bridge)
  *
  * @module @dsh-cline/host-services/web-gateway
  */
@@ -237,4 +238,29 @@ export function registerWebGateway(
       }
     },
   }), 'dsh-cline-host-services: restart route')
+
+  // Shengsuanyun OAuth login (ported from cline-Chinese): the extension host
+  // builds the auth URL with its own vscode:// callback and opens the system
+  // browser. The exchanged key comes back through the bridge relay into the
+  // iframe, so this route only triggers the flow.
+  ctx.effect(() => webServer.register({
+    kind: 'exact',
+    path: '/dsh-cline/ssy-login',
+    handler: async (req, res) => {
+      if (req.method !== 'POST') {
+        res.writeHead(405).end()
+        return
+      }
+      if (bridge === undefined) {
+        sendJson(res, 503, { error: 'no VS Code bridge (plain dsh web)' })
+        return
+      }
+      try {
+        const opened = await bridge.call('vscode.ssy', 'login', [])
+        sendJson(res, 200, opened as object)
+      } catch (err: unknown) {
+        sendJson(res, 400, { error: String(err) })
+      }
+    },
+  }), 'dsh-cline-host-services: ssy-login route')
 }

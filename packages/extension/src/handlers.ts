@@ -17,6 +17,9 @@ interface PathPayload {
   line?: number
 }
 
+/** The vscode:// callback authority (publisher.name) for the Shengsuanyun OAuth flow. */
+export const SSY_CALLBACK_AUTHORITY = 'shengsuan-cloud.cline-shengsuan'
+
 /** Resolve a model-supplied path against the workspace; absolute paths pass through. */
 function resolvePath(path: string): vscode.Uri {
   if (/^([a-zA-Z]:[\\/]|\\\\|\/)/.test(path)) return vscode.Uri.file(path)
@@ -82,6 +85,18 @@ export function registerHandlers(bridge: BridgeServer, extensionVersion: string,
     if (actions?.restartDsh === undefined) throw new Error('sidecar manager not wired')
     actions.restartDsh()
     return { restarting: true }
+  })
+
+  // Shengsuanyun OAuth login (ported from cline-Chinese): open the auth page in
+  // the system browser with a vscode:// callback; the URI handler in
+  // extension.ts exchanges the returned code for an API key. The callback URL
+  // must be built HERE - only the extension knows its own publisher/name id.
+  bridge.handle('vscode.ssy.login', async () => {
+    const callbackUrl = `${vscode.env.uriScheme}://${SSY_CALLBACK_AUTHORITY}/ssy`
+    const authUrl = new URL('https://router.shengsuanyun.com/auth')
+    authUrl.searchParams.set('callback_url', callbackUrl)
+    const opened = await vscode.env.openExternal(vscode.Uri.parse(authUrl.toString()))
+    return { opened, callbackUrl }
   })
 
   bridge.handle('vscode.window.info', async args => {

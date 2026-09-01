@@ -16,8 +16,8 @@ import type { ReactNode } from 'react'
 import type { IApiClient } from '@deepseek-ai/dsh-api-remotes/client'
 import { SsyModelSelect } from './ssy-models.tsx'
 import {
-  declareCustomProvider, openExternal, probeProviders, readDefaultModel, readProviderRows,
-  removeProviderRow, saveProviderKey, saveSsyModel, saveSsySetup, SSY_SIGNUP_URL,
+  declareCustomProvider, listenSsyKey, openExternal, probeProviders, readDefaultModel, readProviderRows,
+  removeProviderRow, saveProviderKey, saveSsyModel, saveSsySetup, ssyLogin, SSY_SIGNUP_URL,
   type DefaultModel, type ProviderRowView, type SsyModel,
 } from './shared.ts'
 
@@ -105,6 +105,27 @@ function Loaded({ api }: { api: IApiClient }): ReactNode {
   }, [api])
 
   useEffect(() => { void reload() }, [reload])
+
+  // Shengsuanyun OAuth login (ported from cline-Chinese): a key exchanged after
+  // the browser flow lands here through the shell relay and fills the field,
+  // exactly like a manual paste - the user then picks the model and saves.
+  const [loginBusy, setLoginBusy] = useState(false)
+  useEffect(() => listenSsyKey(apiKey => {
+    setKeyDraft(apiKey)
+    setError(undefined)
+    setSavedNote('胜算云登录成功：API Key 已自动填入，选择模型后点保存即可。')
+  }), [])
+  const login = async (): Promise<void> => {
+    if (loginBusy) return
+    setLoginBusy(true)
+    try {
+      await ssyLogin()
+    } catch (err: unknown) {
+      setError(String(err instanceof Error ? err.message : err))
+    } finally {
+      setLoginBusy(false)
+    }
+  }
 
   const save = async (): Promise<void> => {
     if (busy || incomplete) return
@@ -249,6 +270,17 @@ function Loaded({ api }: { api: IApiClient }): ReactNode {
             placeholder={ssyKeyed === true ? '输入新 Key 以替换（留空则仅改模型）' : 'sk-...'}
             onChange={e => { setKeyDraft(e.target.value) }}
           />
+          {ssyKeyed !== true && (
+            <button
+              type="button"
+              className="dshc-btn"
+              disabled={loginBusy}
+              onClick={() => { void login() }}
+              title="在系统浏览器中登录胜算云，授权后 API Key 自动填入（也可手动粘贴）"
+            >
+              {loginBusy ? '打开中…' : '登录胜算云'}
+            </button>
+          )}
           <button type="button" className="dshc-btn ghost" onClick={() => { void openExternal(SSY_SIGNUP_URL) }}>
             获取 API Key
           </button>

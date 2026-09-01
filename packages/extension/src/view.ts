@@ -72,6 +72,18 @@ export class DshClineView implements vscode.WebviewViewProvider, vscode.Disposab
     void this.ensureStarted()
   }
 
+  /**
+   * Push one payload down into the DSH iframe on every live surface (the shell
+   * relays `dsh-cline.shell/bridge` messages into the frame). Used by the
+   * Shengsuanyun OAuth flow to deliver a freshly exchanged API key to the
+   * client plugin, which fills it into the key field like a manual paste.
+   */
+  broadcastToFrame(payload: Record<string, unknown>): void {
+    const message = { channel: 'dsh-cline.shell', type: 'bridge', payload }
+    if (this.view !== undefined) void this.view.webview.postMessage(message)
+    if (this.panel !== undefined) void this.panel.webview.postMessage(message)
+  }
+
   dispose(): void {
     for (const d of this.disposables) d.dispose()
     this.panel?.dispose()

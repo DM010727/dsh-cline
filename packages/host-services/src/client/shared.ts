@@ -106,6 +106,33 @@ export async function openExternal(url: string): Promise<void> {
   window.open(url, '_blank', 'noopener')
 }
 
+/**
+ * Start the Shengsuanyun OAuth login (ported from cline-Chinese): the
+ * extension host opens router.shengsuanyun.com/auth in the system browser with
+ * a vscode:// callback. When the flow completes, the exchanged API key arrives
+ * as a `dsh-cline.ssy-key` message relayed through the shell - see
+ * {@link listenSsyKey}.
+ */
+export async function ssyLogin(): Promise<void> {
+  const response = await fetch('/dsh-cline/ssy-login', { method: 'POST' })
+  if (!response.ok) throw new Error('发起胜算云登录失败（HTTP ' + String(response.status) + '）')
+}
+
+/**
+ * Listen for an API key the extension exchanged after a Shengsuanyun OAuth
+ * login (delivered through the shell's bridge relay). Returns a disposer.
+ */
+export function listenSsyKey(onKey: (apiKey: string) => void): () => void {
+  const listener = (ev: MessageEvent): void => {
+    const d = ev.data as { channel?: unknown; apiKey?: unknown } | null
+    if (d !== null && typeof d === 'object' && d.channel === 'dsh-cline.ssy-key' && typeof d.apiKey === 'string') {
+      onKey(d.apiKey)
+    }
+  }
+  window.addEventListener('message', listener)
+  return () => { window.removeEventListener('message', listener) }
+}
+
 /** Read one dsh-cline.* setting through the gateway (VS Code configuration). */
 export async function readVscodeConfig(key: string): Promise<unknown> {
   const response = await fetch('/dsh-cline/vscode-config?key=' + encodeURIComponent(key))

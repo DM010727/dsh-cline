@@ -9,7 +9,7 @@ import * as os from 'node:os'
 import { SidecarManager } from './sidecar'
 import { DshClineView } from './view'
 import { BridgeServer } from './bridge'
-import { registerHandlers } from './handlers'
+import { registerHandlers, SSY_CALLBACK_AUTHORITY } from './handlers'
 import { editPreviewContentProvider, EDIT_URI_SCHEME, reopenLastEditPreview } from './edit-preview'
 import { getSelectionContext, buildTaskPrompt, sendTask } from './selection-actions'
 import { ensurePluginInstalled, dshClineHome } from './plugin-install'
@@ -380,6 +380,18 @@ export function activate(context: vscode.ExtensionContext): Promise<void> {
     showTerminal: () => serviceTerminal().show(true),
   }, String(context.extension.packageJSON.version ?? '0.0.0'))
 
+  // Shengsuanyun OAuth callback (ported from cline-Chinese): the login button
+  // opens router.shengsuanyun.com/auth with a vscode:// callback; the browser
+  // lands here with ?code=, which is exchanged for an API key and relayed into
+  // the DSH iframe so the key field fills itself (manual paste still works).
+  context.subscriptions.push(
+    vscode.window.registerUriHandler({
+      handleUri: (uri: vscode.Uri) => {
+        void handleSsyCallback(uri, view, channel)
+      },
+    }),
+  )
+
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90)
   status.command = 'dsh-cline.openPanel'
   status.name = 'DSH Cline'
@@ -539,4 +551,39 @@ function portOf(url: string): string {
   } catch {
     return url
   }
+}
+
+/**
+ * Exchange a Shengsuanyun OAuth callback code for an API key (ported from
+ * cline-Chinese's handleShengSuanYunCallback) and deliver it to the DSH client
+ * so the key field fills itself; the user still picks the model and saves.
+ */
+async function handleSsyCallback(uri: vscode.Uri, view: DshClineView, channel: vscode.OutputChannel): Promise<void> {
+  const path = uri.path.replace(/\/+$/, '')
+  if (path !== '/ssy' && path !== '/shengsuanyun') return
+  const code = new URL(uri.query ?? '', 'https://x').searchParams.get('code')
+  if (code === null || code === '') {
+    void vscode.window.showErrorMessage('胜算云登录回调缺少 code 参数')
+    return
+  }
+  const callbackUrl = `${vscode.env.uriScheme}://${SSY_CALLBACK_AUTHORITY}/ssy`
+  let apiKey: string | undefined
+  try {
+    const response = await fetch('https://api.shengsuanyun.com/auth/keys', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ code, callback_url: callbackUrl }),
+    })
+    const body = await response.json() as { data?: { api_key?: unknown } }
+    const key = body.data?.api_key
+    if (typeof key === 'string' && key !== '') apiKey = key
+  } catch (err: unknown) {
+    channel.appendLine('[ssy-login] code exchange failed: ' + String(err))
+  }
+  if (apiKey === undefined) {
+    void vscode.window.showErrorMessage('登录胜算云成功，但未获取到 API Key，请前往控制台手动创建。')
+    return
+  }
+  view.broadcastToFrame({ channel: 'dsh-cline.ssy-key', apiKey })
+  void vscode.window.showInformationMessage('胜算云登录成功：API Key 已自动填入，请在「模型」页选择模型后保存。')
 }

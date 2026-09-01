@@ -12,7 +12,7 @@ import type { ReactNode } from 'react'
 import type { IApiClient } from '@deepseek-ai/dsh-api-remotes/client'
 import { SsyModelSelect } from './ssy-models.tsx'
 import {
-  openExternal, probeProviders, saveSsySetup, SSY_SIGNUP_URL, type SsyModel,
+  listenSsyKey, openExternal, probeProviders, saveSsySetup, ssyLogin, SSY_SIGNUP_URL, type SsyModel,
 } from './shared.ts'
 
 /** Face the registration injects (mirrors the DSH slot InjectFace pattern). */
@@ -38,6 +38,25 @@ export function SsyOnboarding(props: SsyOnboardingProps): ReactNode {
   const [apiKey, setApiKey] = useState('')
   const [selected, setSelected] = useState<SsyModel | undefined>(undefined)
   const [error, setError] = useState<string | undefined>(undefined)
+  const [loginBusy, setLoginBusy] = useState(false)
+
+  // Shengsuanyun OAuth login (ported from cline-Chinese): the exchanged key
+  // arrives through the shell relay and fills the field like a manual paste.
+  useEffect(() => listenSsyKey(key => {
+    setApiKey(key)
+    setError(undefined)
+  }), [])
+  const login = async (): Promise<void> => {
+    if (loginBusy) return
+    setLoginBusy(true)
+    try {
+      await ssyLogin()
+    } catch (err: unknown) {
+      setError(String(err instanceof Error ? err.message : err))
+    } finally {
+      setLoginBusy(false)
+    }
+  }
 
   // Readiness: any usable provider ends this step without asking anything.
   useEffect(() => {
@@ -103,11 +122,20 @@ export function SsyOnboarding(props: SsyOnboardingProps): ReactNode {
               onChange={e => { setApiKey(e.target.value) }}
               onKeyDown={e => { if (e.key === 'Enter' && phase === 'ask') void save() }}
             />
+            <button
+              type="button"
+              className="dshc-btn"
+              disabled={loginBusy}
+              onClick={() => { void login() }}
+              title="在系统浏览器中登录胜算云，授权后 API Key 自动填入（也可手动粘贴）"
+            >
+              {loginBusy ? '打开中…' : '登录胜算云'}
+            </button>
             <button type="button" className="dshc-btn ghost" onClick={() => { void openExternal(SSY_SIGNUP_URL) }}>
               获取 API Key
             </button>
           </div>
-          <p className="dshc-hint">点击按钮前往胜算云官网注册领取（浏览器打开）。</p>
+          <p className="dshc-hint">「登录胜算云」在浏览器中授权后自动填入 Key；也可前往官网注册领取后手动粘贴。</p>
         </div>
         <SsyModelSelect value={selected?.id ?? ''} onChange={setSelected} compact />
         {error !== undefined && <p className="dshc-error">{error}</p>}
