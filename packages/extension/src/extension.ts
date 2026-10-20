@@ -2,17 +2,18 @@ import * as vscode from 'vscode'
 import { execFile as execFileCb } from 'node:child_process'
 import { promisify } from 'node:util'
 import * as crypto from 'node:crypto'
-import { readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
-import * as path from 'node:path'
+import { mkdir, rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import * as os from 'node:os'
 import { SidecarManager } from './sidecar'
+import { WebProxy } from './web-proxy'
 import { DshClineView } from './view'
 import { BridgeServer } from './bridge'
 import { registerHandlers, SSY_CALLBACK_AUTHORITY } from './handlers'
 import { editPreviewContentProvider, EDIT_URI_SCHEME, reopenLastEditPreview } from './edit-preview'
 import { getSelectionContext, buildTaskPrompt, sendTask } from './selection-actions'
 import { ensurePluginInstalled, dshClineHome } from './plugin-install'
+import { DSH_RUNTIME_REVISION, checkManagedRuntime, managedInstallLine, launchLine, supportsNode, workspaceKey, servicePort } from './runtime'
 import type { RuntimeStatus, DshVia } from '@dsh-cline/protocol'
 
 const execFile = promisify(execFileCb)
@@ -21,126 +22,36 @@ const execFile = promisify(execFileCb)
 const BRIDGE_ENV = 'DSH_CLINE_BRIDGE'
 
 /**
- * Bridge locator file ($DSH_CLINE_HOME/bridge.json), rewritten at EVERY
+ * Bridge locator file ($DSH_CLINE_HOME/bridge-<workspace-key>.json), rewritten at EVERY
  * activation with the live bridge URL plus this activation's nonce. The
  * terminal-resident dsh web outlives any one extension host (persistent
  * terminal sessions survive window reloads), so the env var it was launched
  * with goes stale on every reload — the running plugin then posts to a dead
  * port ("bridge unreachable: fetch failed"). The plugin reads this file per
  * bridge call, keeping it glued to the current window's bridge with no DSH
- * restart. The nonce lets a deactivating OLD host remove only its own file,
- * never the replacement a new window just wrote.
+ * restart. Deactivation leaves the locator for the next activation to replace,
+ * so an old host cannot race a new window by deleting its locator.
  */
 function bridgeFile(): string {
-  return join(dshClineHome(), 'bridge.json')
+  return join(dshClineHome(), 'bridge-' + workspaceKey(workspaceRoot()) + '.json')
 }
 
-/** Pinned runtime version the guided install puts on PATH. */
-const DSH_VERSION = '0.1.0-rc.7'
+function workspaceRoot(): string { return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? os.homedir() }
 
-/**
- * Default loopback port of the terminal-resident DSH service. Terminal mode
- * cannot learn an OS-assigned port from stdout, so the port must be fixed -
- * which also lets the extension bind to a DSH the user started themselves.
- * A configured 0 (the old "random port" default) falls back to this too.
- */
-const DSH_PORT = 52341
+const terminalShell = process.platform === 'win32'
+  ? { shellPath: join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'), shellArgs: ['-NoLogo', '-NoProfile'] }
+  : { shellPath: '/bin/sh' }
 
-/** npm install scripts dsh's native modules need, or node-pty/koffi stay unbuilt. */
-const ALLOW_SCRIPTS_PKGS = '@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs'
-
-async function onPath(cmd: string): Promise<boolean> {
-  try {
-    if (process.platform === 'win32') await execFile('where.exe', [cmd], { windowsHide: true })
-    else await execFile('sh', ['-lc', 'command -v ' + cmd])
-    return true
-  } catch {
-    return false
+/** Only the extension's locked, dependency-verified runtime can start a service. */
+async function detectRuntime(assets: string): Promise<RuntimeStatus> {
+  let node = false
+  try { node = supportsNode((await execFile('node', ['--version'], { windowsHide: true, timeout: 5_000 })).stdout) } catch { /* missing Node */ }
+  if (!node) return { node: false, via: 'none', cmd: 'dsh', compatible: false }
+  const verified = await checkManagedRuntime(assets, dshClineHome())
+  return {
+    node, via: verified.ok ? 'managed' : 'none', cmd: verified.command ?? 'dsh',
+    installedVersion: verified.version, compatible: verified.ok, issue: verified.reason,
   }
-}
-
-/** Newest `dsh` shim under the npm npx cache, or undefined when absent. */
-async function inNpxCache(): Promise<string | undefined> {
-  const cache = path.join(os.homedir(), 'AppData', 'Local', 'npm-cache', '_npx')
-  let entries: string[]
-  try {
-    entries = await readdir(cache)
-  } catch {
-    return undefined
-  }
-  let best: { p: string, m: number } | undefined
-  for (const entry of entries) {
-    for (const name of process.platform === 'win32' ? ['dsh.cmd', 'dsh'] : ['dsh']) {
-      const p = path.join(cache, entry, 'node_modules', '.bin', name)
-      try {
-        const s = await stat(p)
-        if (best === undefined || s.mtimeMs > best.m) best = { p, m: s.mtimeMs }
-      } catch { /* not present in this entry */ }
-    }
-  }
-  return best?.p
-}
-
-/**
- * Locate the `dsh` binary the user just installed globally with npm (the guide
- * page's install button runs `npm install -g @deepseek-ai/dsh`). The extension
- * host's PATH is snapshotted at VS Code launch, so `onPath('dsh')` misses a
- * freshly installed global dsh until a full restart — which is exactly why the
- * guide's「重新检测并启动」seemed to do nothing after a successful install.
- * Resolving the npm global prefix pins the absolute path instead, so the
- * recheck (and every launch after it) starts `dsh web` without a restart; the
- * stale-PATH npx-cache fallback is only reached when no global dsh exists.
- */
-async function onNpmGlobalDsh(): Promise<string | undefined> {
-  let stdout: string
-  try {
-    if (process.platform === 'win32') {
-      ({ stdout } = await execFile('cmd.exe', ['/c', 'npm prefix -g'], { windowsHide: true }))
-    } else {
-      ({ stdout } = await execFile('sh', ['-lc', 'npm prefix -g']))
-    }
-  } catch {
-    return undefined
-  }
-  const prefix = stdout.trim()
-  if (prefix === '') return undefined
-  const candidates = process.platform === 'win32'
-    ? [path.join(prefix, 'dsh.cmd'), path.join(prefix, 'dsh')]
-    : [path.join(prefix, 'bin', 'dsh'), path.join(prefix, 'dsh')]
-  for (const p of candidates) {
-    try { await stat(p); return p } catch { /* not present here */ }
-  }
-  return undefined
-}
-
-/** Full detection pass backing the guide page and the sidecar pre-launch. */
-async function getRuntimeStatus(): Promise<RuntimeStatus> {
-  // The shipped default for dshCommand is "dsh" - treat that as "not
-  // configured" so fresh machines fall through to PATH/npx detection and the
-  // onboarding guide instead of spawning a doomed `dsh`.
-  const inspect = vscode.workspace.getConfiguration('dsh-cline').inspect<string>('dshCommand')
-  const configured = inspect?.globalValue ?? inspect?.workspaceValue
-  const node = await onPath('node')
-  if (configured !== undefined && configured !== '') return { node, via: 'configured', cmd: configured }
-  if (await onPath('dsh')) return { node, via: 'path', cmd: 'dsh' }
-  const globalDsh = await onNpmGlobalDsh()
-  if (globalDsh !== undefined) return { node, via: 'path', cmd: globalDsh }
-  const cached = await inNpxCache()
-  if (cached !== undefined) return { node, via: 'npx-cache', cmd: cached }
-  return { node, via: 'none', cmd: 'dsh' }
-}
-
-/** Commands the guide page's install button sends to the terminal. */
-function dshInstallLines(useMirror = false): string[] {
-  return [
-    'npm config set allow-scripts ' + ALLOW_SCRIPTS_PKGS + ' --location=user',
-    // The one-shot --registry flag only affects THIS install: users behind the
-    // GFW often cannot reach registry.npmjs.org at all, and the npmmirror
-    // mirror serves the same package domestically. Not persisted to npm
-    // config, so nothing else on the machine changes.
-    'npm install -g @deepseek-ai/dsh@' + DSH_VERSION
-    + (useMirror ? ' --registry=https://registry.npmmirror.com' : ''),
-  ]
 }
 
 /**
@@ -152,17 +63,32 @@ function dshInstallLines(useMirror = false): string[] {
  * watchdog whenever it dies.
  */
 export function activate(context: vscode.ExtensionContext): Promise<void> {
+  if (!vscode.workspace.isTrusted) return Promise.resolve()
+  const runtimeAssets = join(context.extensionUri.fsPath, 'dist', 'runtime')
+  const getRuntimeStatus = (): Promise<RuntimeStatus> => detectRuntime(runtimeAssets)
   const bridge = new BridgeServer()
+  const webProxy = new WebProxy()
   // Cline-style pre-write edit preview: virtual documents whose right side DSH
   // animates as it applies an edit (see edit-preview.ts).
   context.subscriptions.push(
     vscode.workspace.registerTextDocumentContentProvider(EDIT_URI_SCHEME, editPreviewContentProvider),
+    vscode.workspace.onDidCloseTextDocument(document => {
+      if (document.uri.scheme === EDIT_URI_SCHEME) editPreviewContentProvider.delete(document.uri)
+    }),
+    editPreviewContentProvider,
   )
   // The sidecar is created further down; the restart handler reads through
   // this indirection so registration order never matters.
   let restartSidecar = (): void => { /* wired below once the sidecar exists */ }
+  let pendingLogin: { state: string; callbackUrl: string; expires: number } | undefined
   registerHandlers(bridge, String(context.extension.packageJSON.version ?? '0.0.0'), {
     restartDsh: () => restartSidecar(),
+    createSsyCallback: () => {
+      const state = crypto.randomBytes(24).toString('base64url')
+      const callbackUrl = `${vscode.env.uriScheme}://${SSY_CALLBACK_AUTHORITY}/ssy?state=${state}`
+      pendingLogin = { state, callbackUrl, expires: Date.now() + 10 * 60_000 }
+      return callbackUrl
+    },
   })
 
   let bridgeUrl: string | undefined
@@ -173,30 +99,23 @@ export function activate(context: vscode.ExtensionContext): Promise<void> {
    * bridge call. Best-effort: a write failure only means the plugin keeps
    * using its (possibly stale) env value.
    */
-  const publishBridgeUrl = (url: string): void => {
-    writeFile(bridgeFile(), JSON.stringify({ url, nonce: bridgeNonce }) + '\n', 'utf8')
-      .catch((err: unknown) => channel.appendLine('[bridge] locator write failed: ' + String(err)))
-  }
-  /** Remove the locator only if it is still OURS (nonce match). */
-  const unpublishBridgeUrl = (): Promise<void> => {
-    return readFile(bridgeFile(), 'utf8').then(text => {
-      const parsed = JSON.parse(text) as { nonce?: unknown }
-      if (parsed.nonce === bridgeNonce) return rm(bridgeFile(), { force: true })
-    }).catch(() => { /* absent/corrupt/replaced: nothing safe to remove */ })
+  const publishBridgeUrl = async (url: string): Promise<void> => {
+    await mkdir(dshClineHome(), { recursive: true })
+    const temp = bridgeFile() + '.' + bridgeNonce + '.tmp'
+    await writeFile(temp, JSON.stringify({ url, nonce: bridgeNonce }) + '\n', { encoding: 'utf8', mode: 0o600 })
+    await rename(temp, bridgeFile())
   }
   let dsh = { cmd: 'dsh', via: 'none' as DshVia }
   // Terminal handles are session-scoped variables, never workspaceState: a
   // Terminal object does not survive a window reload (it serializes to an
   // empty object whose exitStatus stays undefined, and sendText on it fails).
   let installTerminal: vscode.Terminal | undefined
-  let serviceTerminalRef: vscode.Terminal | undefined
+  const serviceTerminalName = 'DSH Cline 服务 · ' + workspaceKey(workspaceRoot()).slice(0, 8)
+  let serviceTerminalRef = vscode.window.terminals.find(terminal => terminal.name === serviceTerminalName && terminal.exitStatus === undefined)
   const channel = vscode.window.createOutputChannel('DSH Cline')
   /**
-   * Resolution chain, re-run before every launch: explicit config -> PATH ->
-   * npx cache. Never installs anything: when nothing resolves, the view shows
-   * the onboarding guide and the user installs globally from a terminal. Also
-   * (re)installs the DSH-side plugin first - idempotent, cheap when current -
-   * so the dsh web that follows always carries both plugin halves.
+   * Revalidate the managed runtime before every launch, then install/heal the
+   * plugin. Missing or altered dependencies return to the explicit repair flow.
    */
   /**
    * Set when this activation installed a NEW plugin version on disk. A bound
@@ -208,13 +127,7 @@ export function activate(context: vscode.ExtensionContext): Promise<void> {
   const ensureRuntime = async (detail?: (msg: string) => void): Promise<void> => {
     const rt = await getRuntimeStatus()
     dsh = { cmd: rt.cmd, via: rt.via === 'configured' ? 'configured' : rt.via }
-    // Only `none` (no resolvable dsh at all) skips the plugin install. `npx-cache`
-    // still installs/updates the vendored host-services: the file copy needs no
-    // dsh command, and the trailing profile scaffold is already non-fatal. Skipping
-    // npx-cache here stranded the installed plugin at an old version (the running
-    // npx-cache dsh web loaded e.g. 0.2.0 while the vsix vendored 0.3.4), which is
-    // why the diff-mirror and other host-side features never took effect.
-    if (rt.via === 'none') return
+    if (rt.compatible !== true) throw new Error(rt.issue ?? '请先安装／修复扩展专用 DSH 运行时')
     detail?.('正在安装/更新 DSH Cline 插件…')
     try {
       const actions = await ensurePluginInstalled(
@@ -225,48 +138,49 @@ export function activate(context: vscode.ExtensionContext): Promise<void> {
       if (actions.some(action => action.startsWith('host-services '))) pluginUpdated = true
     } catch (err: unknown) {
       channel.appendLine('[plugin-install] failed: ' + String(err))
+      throw err
     }
   }
 
   /**
-   * Run the guided global install in a visible VS Code terminal so the user
-   * watches progress and any npm failure directly. `npm config set` first:
-   * the `--allow-scripts` flag is rejected in project scope and older npm may
-   * not know the flag at all, while an unknown user config key is harmless.
+   * Run the pinned isolated install in a visible VS Code terminal. Stop this
+   * workspace's previous service before replacing runtime files; no global npm
+   * settings or original DSH configuration are changed.
    */
   const runGuidedInstall = (lines: string[]): void => {
     if (installTerminal === undefined || installTerminal.exitStatus !== undefined) {
-      installTerminal = vscode.window.createTerminal('DSH Cline 安装')
+      installTerminal = vscode.window.createTerminal({ name: 'DSH Cline 安装', ...terminalShell })
     }
+    // An explicit runtime repair also stops the service from the previous install.
+    if (serviceTerminalRef !== undefined && serviceTerminalRef.exitStatus === undefined) serviceTerminalRef.sendText(String.fromCharCode(3))
+    sidecar.stop()
     installTerminal.show(true)
-    for (const line of lines) installTerminal.sendText(line)
+    const terminal = installTerminal
+    void waitShellReady(terminal).then(() => { for (const line of lines) terminal.sendText(line) })
   }
 
   /** The (reused) terminal the DSH service lives in; recreated when closed. */
   const serviceTerminal = (): vscode.Terminal => {
     if (serviceTerminalRef === undefined || serviceTerminalRef.exitStatus !== undefined) {
       serviceTerminalRef = vscode.window.createTerminal({
-        name: 'DSH Cline 服务',
+        name: serviceTerminalName,
+        ...terminalShell,
         // The workspace folder as cwd (checkpoints key on it) and the bridge
         // URL injected at creation, so whatever shell the user runs still
         // passes it to the DSH-side host-services plugin. DSH_HOME isolates
         // this instance's whole config tree (settings/credentials/profiles/
         // sessions) into ~/.dsh-cline - the user's own ~/.dsh stays untouched.
-        cwd: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
+        cwd: workspaceRoot(),
         env: {
           DSH_HOME: dshClineHome(),
+          DSH_CLINE_RUNTIME_REVISION: DSH_RUNTIME_REVISION,
+          DSH_CLINE_BRIDGE_FILE: bridgeFile(),
           ...(bridgeUrl === undefined ? {} : { [BRIDGE_ENV]: bridgeUrl }),
         },
       })
     }
     return serviceTerminalRef
   }
-  /** One launch line typed into the service terminal, quoting a spaced path. */
-  const launchLine = (cmd: string, args: string[]): string => {
-    const exe = /\s/.test(cmd) ? '"' + cmd + '"' : cmd
-    return [exe, ...args].join(' ')
-  }
-
   /**
    * Wait for a FRESHLY created terminal's shell to accept input before
    * sendText: on Windows the pty accepts writes before PowerShell is ready,
@@ -336,31 +250,43 @@ export function activate(context: vscode.ExtensionContext): Promise<void> {
   }
 
   const sidecar = new SidecarManager(() => {
+    if (bridgeUrl === undefined) throw new Error('DSH Cline 本机桥尚未就绪，请重试。')
     const cfg = vscode.workspace.getConfiguration('dsh-cline')
     const host = cfg.get<string>('host') ?? '127.0.0.1'
-    const port = cfg.get<number>('port') ?? DSH_PORT
+    if (host !== '127.0.0.1' && host !== 'localhost') throw new Error('DSH Cline 仅允许绑定本机回环地址')
+    const inspect = cfg.inspect<number>('port')
+    const port = servicePort(inspect?.workspaceFolderValue ?? inspect?.workspaceValue ?? inspect?.globalValue, workspaceRoot())
     return {
       cmd: dsh.cmd,
-      args: ['web', '--host', host, '--port', String(port === 0 ? DSH_PORT : port)],
+      args: ['web', '--no-open', '--host', host, '--port', String(port)],
       host,
-      port: port === 0 ? DSH_PORT : port,
+      port,
+      workspaceRoot: workspaceRoot(),
+      runtimeRevision: DSH_RUNTIME_REVISION,
+      bootstrapKey: bridgeUrl,
     }
   }, ensureRuntime, {
-    launch: async cmd => {
+    launch: async (cmd, signal) => {
       const fresh = serviceTerminalRef === undefined || serviceTerminalRef.exitStatus !== undefined
       const terminal = serviceTerminal()
       terminal.show(true)
       if (fresh) await waitShellReady(terminal)
       else await new Promise(resolve => { setTimeout(resolve, 300) })
-      terminal.sendText(launchLine(cmd.cmd, cmd.args))
+      if (signal?.aborted) throw new Error('superseded')
+      const revisionEnv = process.platform === 'win32'
+        ? "$env:DSH_CLINE_RUNTIME_REVISION = '" + DSH_RUNTIME_REVISION + "'; "
+        : "export DSH_CLINE_RUNTIME_REVISION='" + DSH_RUNTIME_REVISION + "'; "
+      terminal.sendText(revisionEnv + launchLine(cmd.cmd, cmd.args))
     },
     alive: () => serviceTerminalRef !== undefined && serviceTerminalRef.exitStatus === undefined,
     discoverUrls: discoverDshWebUrls,
     interrupt: () => {
       // Ctrl+C (ETX) in the service terminal; restart() waits for the probe to die.
-      serviceTerminalRef?.sendText(String.fromCharCode(3))
+      if (serviceTerminalRef === undefined || serviceTerminalRef.exitStatus !== undefined) return false
+      serviceTerminalRef.sendText(String.fromCharCode(3))
+      return true
     },
-  })
+  }, (origin, authenticatedUrl) => webProxy.connect(origin, authenticatedUrl))
   // In-GUI「重启 DSH 服务」(web「DSH Cline」section -> bridge -> here).
   restartSidecar = () => {
     sidecar.restart().catch(() => { /* state broadcast already surfaced */ })
@@ -379,7 +305,7 @@ export function activate(context: vscode.ExtensionContext): Promise<void> {
 
   const view = new DshClineView(sidecar, {
     getRuntime: getRuntimeStatus,
-    installDsh: (useMirror: boolean) => runGuidedInstall(dshInstallLines(useMirror)),
+    installDsh: (useMirror: boolean) => runGuidedInstall([managedInstallLine(runtimeAssets, dshClineHome(), useMirror)]),
     installNode: () => runGuidedInstall(['winget install OpenJS.NodeJS.LTS']),
     openNodePage: () => void vscode.env.openExternal(vscode.Uri.parse('https://nodejs.org/')),
     showTerminal: () => serviceTerminal().show(true),
@@ -392,7 +318,14 @@ export function activate(context: vscode.ExtensionContext): Promise<void> {
   context.subscriptions.push(
     vscode.window.registerUriHandler({
       handleUri: (uri: vscode.Uri) => {
-        void handleSsyCallback(uri, view, channel)
+        const query = new URLSearchParams(uri.query)
+        if (!pendingLogin || pendingLogin.expires < Date.now() || query.get('state') !== pendingLogin.state) {
+          void vscode.window.showErrorMessage('登录回调已过期或不是由本窗口发起，请重新登录。')
+          return
+        }
+        const callbackUrl = pendingLogin.callbackUrl
+        pendingLogin = undefined
+        void handleSsyCallback(uri, view, channel, callbackUrl)
       },
     }),
   )
@@ -423,7 +356,7 @@ export function activate(context: vscode.ExtensionContext): Promise<void> {
 
   // Selection actions (editor context menu). Each captures the active selection,
   // builds a prompt, expands @-mentions, and POSTs it to the DSH-side task route
-  // so the reply streams into the conversation the user is viewing.
+  // and navigates the panel to the new session returned by that workspace.
   const runSelectionAction = async (action: 'explain' | 'improve' | 'add'): Promise<void> => {
     const ctx = getSelectionContext()
     if (ctx === undefined) {
@@ -435,9 +368,7 @@ export function activate(context: vscode.ExtensionContext): Promise<void> {
       void vscode.window.showWarningMessage('DSH Sidecar 未就绪，无法发送')
       return
     }
-    // If the DSH panel isn't open, bring it up so the reply lands somewhere the
-    // user can see (host-services creates a session for the message if none is
-    // active, per requirement #2).
+    // Create the surface before sending, so navigation can wait for hydration.
     try { view.openPanel() } catch { /* best-effort: panel open is cosmetic */ }
     const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
     try {
@@ -447,6 +378,7 @@ export function activate(context: vscode.ExtensionContext): Promise<void> {
         void vscode.window.showErrorMessage('DSH Cline 任务发送失败：' + (result.error ?? '未知错误'))
         return
       }
+      if (result.sessionId) view.broadcastToFrame({ channel: 'dsh-cline.open-session', sessionId: result.sessionId })
       const verb = action === 'explain' ? '解释' : action === 'improve' ? '优化' : '添加'
       void vscode.window.showInformationMessage('已用 DSH Cline ' + verb + '（请在 DSH 面板查看）')
     } catch (err: unknown) {
@@ -459,6 +391,7 @@ export function activate(context: vscode.ExtensionContext): Promise<void> {
       webviewOptions: { retainContextWhenHidden: true },
     }),
     vscode.commands.registerCommand('dsh-cline.openPanel', () => view.openPanel()),
+    vscode.commands.registerCommand('dsh-cline.updateRuntime', () => runGuidedInstall([managedInstallLine(runtimeAssets, dshClineHome())])),
     vscode.commands.registerCommand('dsh-cline.restoreCheckpoint', async () => {
       const status = sidecar.status()
       if (status.state !== 'ready' || status.url === undefined) {
@@ -466,7 +399,8 @@ export function activate(context: vscode.ExtensionContext): Promise<void> {
         return
       }
       try {
-        const listRes = await fetch(status.url + '/dsh-cline/checkpoints')
+        const listRes = await fetch(status.url + '/dsh-cline/checkpoints', { signal: AbortSignal.timeout(15_000) })
+        if (!listRes.ok) throw new Error('读取检查点 HTTP ' + listRes.status)
         const list = await listRes.json() as { workspace?: string, checkpoints?: Array<{ id: string, label: string, time: number }> }
         const entries = list.checkpoints ?? []
         if (entries.length === 0) {
@@ -482,9 +416,10 @@ export function activate(context: vscode.ExtensionContext): Promise<void> {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ id: pick.id }),
+          signal: AbortSignal.timeout(60_000),
         })
         const restored = await restoreRes.json() as { restored?: string, error?: string }
-        if (restored.error !== undefined) throw new Error(restored.error)
+        if (!restoreRes.ok || restored.error !== undefined || typeof restored.restored !== 'string') throw new Error(restored.error ?? '恢复检查点失败')
         void vscode.window.showInformationMessage('已恢复检查点 ' + String(restored.restored))
       } catch (err: unknown) {
         void vscode.window.showErrorMessage('检查点操作失败：' + String(err))
@@ -593,8 +528,8 @@ export function activate(context: vscode.ExtensionContext): Promise<void> {
     }),
     vscode.workspace.onDidChangeConfiguration(e => {
       // The pre-launch hook re-resolves config on every start, so a plain
-      // restart picks up dshCommand/autoInstall edits.
-      if (e.affectsConfiguration('dsh-cline') && sidecar.status().state !== 'stopped') {
+      // restart picks up the listener settings.
+      if (['dsh-cline.host', 'dsh-cline.port'].some(key => e.affectsConfiguration(key)) && sidecar.status().state !== 'stopped') {
         sidecar.restart().catch(() => { /* surfaced via status */ })
       }
     }),
@@ -602,14 +537,15 @@ export function activate(context: vscode.ExtensionContext): Promise<void> {
     view,
     status,
     channel,
-    { dispose: () => { void bridge.dispose().then(unpublishBridgeUrl) } },
+    { dispose: () => { void bridge.dispose() } },
+    { dispose: () => { void webProxy.dispose() } },
   )
 
   // Resolve the bridge URL before any sidecar launch can observe it; the dsh
   // runtime resolves lazily in the sidecar's pre-launch hook.
-  return bridge.start().then(url => {
+  return bridge.start().then(async url => {
     bridgeUrl = url
-    publishBridgeUrl(url)
+    await publishBridgeUrl(url)
   })
 }
 
@@ -626,7 +562,7 @@ function portOf(url: string): string {
  * cline-Chinese's handleShengSuanYunCallback) and deliver it to the DSH client
  * so the key field fills itself; the user still picks the model and saves.
  */
-async function handleSsyCallback(uri: vscode.Uri, view: DshClineView, channel: vscode.OutputChannel): Promise<void> {
+async function handleSsyCallback(uri: vscode.Uri, view: DshClineView, channel: vscode.OutputChannel, callbackUrl: string): Promise<void> {
   const path = uri.path.replace(/\/+$/, '')
   if (path !== '/ssy' && path !== '/shengsuanyun') return
   // vscode.Uri.query has NO leading '?': without prepending one, URL() parses
@@ -637,14 +573,19 @@ async function handleSsyCallback(uri: vscode.Uri, view: DshClineView, channel: v
     void vscode.window.showErrorMessage('胜算云登录回调缺少 code 参数')
     return
   }
-  const callbackUrl = `${vscode.env.uriScheme}://${SSY_CALLBACK_AUTHORITY}/ssy`
   let apiKey: string | undefined
   try {
     const response = await fetch('https://api.shengsuanyun.com/auth/keys', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        // Mark every Shengsuanyun-bound request as coming from DSH Cline.
+        'X-title': 'DSH-Cline',
+      },
       body: JSON.stringify({ code, callback_url: callbackUrl }),
+      signal: AbortSignal.timeout(30_000),
     })
+    if (!response.ok) throw new Error('Key exchange HTTP ' + response.status)
     const body = await response.json() as { data?: { api_key?: unknown } }
     const key = body.data?.api_key
     if (typeof key === 'string' && key !== '') apiKey = key
@@ -656,5 +597,5 @@ async function handleSsyCallback(uri: vscode.Uri, view: DshClineView, channel: v
     return
   }
   view.broadcastToFrame({ channel: 'dsh-cline.ssy-key', apiKey })
-  void vscode.window.showInformationMessage('胜算云登录成功：API Key 已自动填入，请在「模型」页选择模型后保存。')
+  void vscode.window.showInformationMessage('胜算云授权已返回，请在「模型」页确认登录结果；首次添加需选择模型并保存。')
 }

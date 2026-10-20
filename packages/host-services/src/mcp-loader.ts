@@ -49,19 +49,21 @@ export function mcpConfigFile(): string {
  * @returns every server entry, validated and `disabled` flag preserved.
  */
 export function validateMcpDocument(doc: McpDocument): Record<string, Record<string, unknown>> {
-  if (typeof doc.servers !== 'object' || doc.servers === null || Array.isArray(doc.servers)) {
+  if (doc === null || typeof doc !== 'object' || typeof doc.servers !== 'object' || doc.servers === null || Array.isArray(doc.servers)) {
     throw new Error('mcp.json 必须包含 "servers" 对象')
   }
-  const out: Record<string, Record<string, unknown>> = {}
+  const out: Record<string, Record<string, unknown>> = Object.create(null) as Record<string, Record<string, unknown>>
+  if (Object.keys(doc.servers).length > 128) throw new Error('mcp.json: at most 128 servers are supported')
   for (const [serverName, declared] of Object.entries(doc.servers as Record<string, unknown>)) {
     if (!SERVER_NAME_PATTERN.test(serverName)) {
       throw new Error('MCP 服务器名 ' + JSON.stringify(serverName) + ' 须匹配 [A-Za-z0-9_-]{1,32}')
     }
-    if (typeof declared !== 'object' || declared === null) {
+    if (typeof declared !== 'object' || declared === null || Array.isArray(declared)) {
       throw new Error('MCP 服务器 ' + JSON.stringify(serverName) + ' 必须是对象')
     }
     const entry = declared as DeclaredServer
-    if (entry.disabled !== true) serverConfig(serverName, entry)
+    if (entry.disabled !== undefined && typeof entry.disabled !== 'boolean') throw new Error('MCP disabled must be boolean')
+    serverConfig(serverName, entry)
     out[serverName] = entry as Record<string, unknown>
   }
   return out
@@ -104,20 +106,58 @@ export async function loadMcpServers(ctx: Context): Promise<number> {
 
 /** Validate one declared server into the client plugin's config shape. */
 function serverConfig(serverName: string, declared: DeclaredServer): Record<string, unknown> {
+  validateOptions(declared)
   if (declared.transport === 'stdio') {
-    if (typeof declared.command !== 'string' || declared.command === '') {
+    if (typeof declared.command !== 'string' || declared.command.trim() === '' || declared.command.includes('\0')) {
       throw new Error('dsh-cline mcp.json: stdio server ' + serverName + ' needs "command"')
     }
-    return { ...pick(declared), serverName, transport: 'stdio' }
+    return { ...pick(declared), serverName, transport: 'stdio', command: declared.command }
   }
   if (declared.transport === 'streamable-http') {
-    if (typeof declared.url !== 'string' || !/^https?:\/\//.test(declared.url)) {
+    let validUrl = false
+    try {
+      const url = new URL(typeof declared.url === 'string' ? declared.url : '')
+      validUrl = ['http:', 'https:'].includes(url.protocol) && url.username === '' && url.password === ''
+    } catch { /* report the same actionable error below */ }
+    if (!validUrl) {
       throw new Error('dsh-cline mcp.json: streamable-http server ' + serverName + ' needs an http(s) "url"')
     }
     return { ...pick(declared), serverName, transport: 'streamable-http' }
   }
   throw new Error('dsh-cline mcp.json: server ' + serverName
     + ' needs "transport": "stdio" or "streamable-http"')
+}
+
+/** Reject malformed values before they can break the next process startup. */
+function validateOptions(entry: DeclaredServer): void {
+  if (entry.args !== undefined && (!Array.isArray(entry.args) || entry.args.some(arg => typeof arg !== 'string' || arg.includes('\0')))) {
+    throw new Error('MCP args must be an array of strings without NUL')
+  }
+  for (const field of ['env', 'headers'] as const) {
+    const value = entry[field]
+    if (value !== undefined && (value === null || typeof value !== 'object' || Array.isArray(value)
+      || Object.entries(value).some(([key, item]) => key.includes('\0') || typeof item !== 'string' || item.includes('\0')))) {
+      throw new Error('MCP ' + field + ' must contain string values')
+    }
+  }
+  if (entry.cwd !== undefined && (typeof entry.cwd !== 'string' || entry.cwd.includes('\0'))) throw new Error('MCP cwd must be a string without NUL')
+  if (entry.failOnStartupError !== undefined && typeof entry.failOnStartupError !== 'boolean') throw new Error('MCP failOnStartupError must be boolean')
+  if (entry.toolCallTimeoutMs !== undefined && (!Number.isInteger(entry.toolCallTimeoutMs) || Number(entry.toolCallTimeoutMs) < 1 || Number(entry.toolCallTimeoutMs) > 2_147_483_647)) {
+    throw new Error('MCP toolCallTimeoutMs must be an integer between 1 and 2147483647')
+  }
+  if (entry.reconnect !== undefined) {
+    if (entry.reconnect === null || typeof entry.reconnect !== 'object' || Array.isArray(entry.reconnect)) throw new Error('MCP reconnect must be an object')
+    const reconnect = entry.reconnect as Record<string, unknown>
+    if (reconnect.enabled !== undefined && typeof reconnect.enabled !== 'boolean') throw new Error('MCP reconnect.enabled must be boolean')
+    for (const key of ['initialDelayMs', 'maxDelayMs', 'maxAttempts'] as const) {
+      const value = reconnect[key]
+      const max = key === 'maxAttempts' ? Number.MAX_SAFE_INTEGER : 2_147_483_647
+      if (value !== undefined && (!Number.isSafeInteger(value) || Number(value) < 1 || Number(value) > max)) throw new Error('MCP reconnect.' + key + ' is out of range')
+    }
+    if (reconnect.initialDelayMs !== undefined && reconnect.maxDelayMs !== undefined && Number(reconnect.initialDelayMs) > Number(reconnect.maxDelayMs)) {
+      throw new Error('MCP reconnect.initialDelayMs cannot exceed maxDelayMs')
+    }
+  }
 }
 
 /** Keep only the optional fields the client config schema understands. */

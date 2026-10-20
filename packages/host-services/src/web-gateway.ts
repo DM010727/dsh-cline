@@ -6,7 +6,6 @@
  *
  * Routes (all loopback-bound with the rest of the carrier):
  * - GET  /dsh-cline/models          proxy the Shengsuanyun model catalog
- * - GET  /dsh-cline/catalog         the pi-ai builtin catalog's provider → model-id map
  * - POST /dsh-cline/open-external   open a URL in the system browser (bridge)
  * - GET  /dsh-cline/vscode-config   read one dsh-cline setting (bridge)
  * - POST /dsh-cline/vscode-config   write one dsh-cline setting (bridge)
@@ -19,12 +18,14 @@
  * @module @dsh-cline/host-services/web-gateway
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs'
-import { dirname, join } from 'node:path'
-import { createRequire } from 'node:module'
+import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, rmSync } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
+import { dirname } from 'node:path'
 import type { Context, WebServerService } from '@deepseek-ai/cordis'
+import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { VscodeHostService } from './index.js'
 import { mcpConfigFile, validateMcpDocument } from './mcp-loader.js'
+import { guardRequest, readJsonObject, requestErrorStatus, RequestError, sendJson } from './request-guard.js'
 
 /** Shengsuanyun account API base (see the SSYAccountService reference). */
 const SSY_API_BASE = 'https://api.shengsuanyun.com'
@@ -33,33 +34,21 @@ const SSY_KEY_REF = 'SHENGSUANYUN_API_KEY'
 /** One account fetch budget. */
 const SSY_ACCOUNT_TIMEOUT_MS = 50_000
 
-/**
- * The stored Shengsuanyun API key from the isolated home's credential
- * document, or undefined when not configured. The `yaml` package resolves
- * from the dsh profile at runtime (host-services ships zero deps).
- */
-function readSsyApiKey(): string | undefined {
-  const home = process.env.DSH_HOME
-  if (home === undefined || home === '') return undefined
-  try {
-    const file = join(home, '.credentials.yaml')
-    const doc = (createRequire(import.meta.url)('yaml') as { parse(text: string): unknown })
-      .parse(readFileSync(file, 'utf8'))
-    if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) return undefined
-    const value = (doc as Record<string, unknown>)[SSY_KEY_REF]
-    return typeof value === 'string' && value !== '' ? value : undefined
-  } catch {
-    return undefined
-  }
+/** Resolve the isolated profile's key through DSH's current credential owner. */
+async function readSsyApiKey(ctx: Context): Promise<string | undefined> {
+  const credentials = ctx.get('credentials') as { resolve(ref: unknown): Promise<{ value: string } | undefined> } | undefined
+  return (await credentials?.resolve(credentialRef(SSY_KEY_REF)))?.value
 }
 
 /** One authenticated GET against the Shengsuanyun account API envelope. */
 async function ssyApiGet<T>(endpoint: string, apiKey: string): Promise<T> {
   const response = await fetch(SSY_API_BASE + endpoint, {
-    headers: { 'content-type': 'application/json', 'x-token': apiKey },
+    headers: { 'content-type': 'application/json', 'x-token': apiKey, 'X-title': 'DSH-Cline' },
     signal: AbortSignal.timeout(SSY_ACCOUNT_TIMEOUT_MS),
+    redirect: 'error',
   })
-  const body = await response.json() as { code?: unknown, data?: unknown }
+  if (!response.ok) throw new Error('account API HTTP ' + String(response.status))
+  const body = JSON.parse(await readLimitedResponse(response)) as { code?: unknown, data?: unknown }
   if (body === null || typeof body !== 'object' || body.data === undefined || body.code === 103) {
     throw new Error('invalid response from ' + endpoint)
   }
@@ -96,35 +85,46 @@ export interface ShengsuanyunModel {
 
 /** Cached catalog response. */
 let modelsCache: { at: number; body: string } | undefined
+let modelsPending: Promise<string> | undefined
 
-/** Read the request body as JSON, size-capped. */
-async function readJson(req: import('node:http').IncomingMessage): Promise<unknown> {
+/** Bound untrusted upstream responses before parsing or caching them. */
+async function readLimitedResponse(response: Response): Promise<string> {
+  if (response.body === null) throw new Error('empty upstream body')
+  const reader = response.body.getReader()
   const chunks: Buffer[] = []
-  let size = 0
-  for await (const chunk of req) {
-    size += (chunk as Buffer).length
-    if (size > 64 * 1024) throw new Error('request body too large')
-    chunks.push(chunk as Buffer)
-  }
-  if (chunks.length === 0) return undefined
-  return JSON.parse(Buffer.concat(chunks).toString('utf8'))
+  let bytes = 0
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      bytes += value.byteLength
+      if (bytes > 8 * 1024 * 1024) throw new Error('upstream body too large')
+      chunks.push(Buffer.from(value))
+    }
+    return Buffer.concat(chunks).toString('utf8')
+  } finally { await reader.cancel().catch(() => {}); reader.releaseLock() }
 }
 
-function sendJson(res: import('node:http').ServerResponse, status: number, body: unknown): void {
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
-  res.end(JSON.stringify(body))
-}
+function mcpRevision(text: string): string { return createHash('sha256').update(text).digest('hex') }
 
 /** Fetch the catalog through the short cache. */
 async function fetchModels(): Promise<string> {
   if (modelsCache !== undefined && Date.now() - modelsCache.at < MODELS_CACHE_MS) {
     return modelsCache.body
   }
-  const response = await fetch(MODELS_URL, { signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS) })
-  if (!response.ok) throw new Error('shengsuanyun models HTTP ' + String(response.status))
-  const body = await response.text()
-  modelsCache = { at: Date.now(), body }
-  return body
+  modelsPending ??= (async () => {
+    const response = await fetch(MODELS_URL, {
+      headers: { 'X-title': 'DSH-Cline' },
+      signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS),
+      redirect: 'error',
+    })
+    if (!response.ok) throw new Error('shengsuanyun models HTTP ' + String(response.status))
+    const body = await readLimitedResponse(response)
+    JSON.parse(body) // do not cache an upstream HTML error page as a valid catalog
+    modelsCache = { at: Date.now(), body }
+    return body
+  })().finally(() => { modelsPending = undefined })
+  return modelsPending
 }
 
 /**
@@ -143,7 +143,8 @@ export function registerWebGateway(
   ctx.effect(() => webServer.register({
     kind: 'exact',
     path: '/dsh-cline/models',
-    handler: async (_req, res) => {
+    handler: async (req, res) => {
+      if (!guardRequest(req, res, ['GET'])) return
       try {
         const body = await fetchModels()
         res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' })
@@ -154,35 +155,11 @@ export function registerWebGateway(
     },
   }), 'dsh-cline-host-services: models route')
 
-  // The pi-ai builtin catalog as the browser half needs it: provider → model
-  // ids. Resolved from the same installation the adapter itself loads, so the
-  // model select can never drift from what the route actually serves.
-  ctx.effect(() => webServer.register({
-    kind: 'exact',
-    path: '/dsh-cline/catalog',
-    handler: async (_req, res) => {
-      try {
-        const compat = await import('@earendil-works/pi-ai/dist/compat.js') as {
-          getProviders(): string[]
-          getModels(provider: string): Array<{ id: string }>
-        }
-        const models: Record<string, string[]> = {}
-        for (const provider of compat.getProviders()) {
-          try {
-            models[provider] = compat.getModels(provider).map(model => model.id)
-          } catch { /* a provider without models stays absent */ }
-        }
-        sendJson(res, 200, { models })
-      } catch (err: unknown) {
-        sendJson(res, 500, { error: 'catalog unavailable: ' + String(err) })
-      }
-    },
-  }), 'dsh-cline-host-services: catalog route')
-
   ctx.effect(() => webServer.register({
     kind: 'exact',
     path: '/dsh-cline/open-external',
     handler: async (req, res) => {
+      if (!guardRequest(req, res, ['POST'], true)) return
       if (req.method !== 'POST') {
         res.writeHead(405).end()
         return
@@ -192,17 +169,18 @@ export function registerWebGateway(
         return
       }
       try {
-        const { url } = await readJson(req) as { url?: unknown }
+        const { url } = await readJsonObject(req)
         if (typeof url !== 'string' || !/^https?:\/\//.test(url)) throw new Error('url must be http(s)')
         const opened = await bridge.call('vscode.browser', 'openExternal', [{ url }])
         sendJson(res, 200, opened as object)
       } catch (err: unknown) {
-        sendJson(res, 400, { error: String(err) })
+        sendJson(res, requestErrorStatus(err), { error: String(err) })
       }
     },
   }), 'dsh-cline-host-services: open-external route')
 
   const config = async (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse): Promise<void> => {
+    if (!guardRequest(req, res, ['GET', 'POST'], true)) return
     if (bridge === undefined) {
       sendJson(res, 503, { error: 'no VS Code bridge (plain dsh web)' })
       return
@@ -215,7 +193,7 @@ export function registerWebGateway(
         return
       }
       if (req.method === 'POST') {
-        const { key, value } = await readJson(req) as { key?: unknown; value?: unknown }
+        const { key, value } = await readJsonObject(req)
         if (typeof key !== 'string' || key === '') throw new Error('key is required')
         await bridge.call('vscode.config', 'update', [key, value])
         sendJson(res, 200, { key, value })
@@ -223,13 +201,13 @@ export function registerWebGateway(
       }
       res.writeHead(405).end()
     } catch (err: unknown) {
-      sendJson(res, 400, { error: String(err) })
+      sendJson(res, requestErrorStatus(err), { error: String(err) })
     }
   }
   ctx.effect(() => webServer.register({
     kind: 'exact',
     path: '/dsh-cline/vscode-config',
-    handler: (req, res) => { void config(req, res) },
+    handler: config,
   }), 'dsh-cline-host-services: vscode-config route')
 
   // MCP declarations live in a file both halves share; the route is
@@ -239,26 +217,34 @@ export function registerWebGateway(
     kind: 'exact',
     path: '/dsh-cline/mcp',
     handler: async (req, res) => {
+      if (!guardRequest(req, res, ['GET', 'POST'], true)) return
       try {
         const file = mcpConfigFile()
         if (req.method === 'GET') {
-          const servers = existsSync(file)
-            ? validateMcpDocument(JSON.parse(readFileSync(file, 'utf8')) as { servers?: unknown })
-            : {}
-          sendJson(res, 200, { file, servers, restartRequired: true })
+          const text = existsSync(file) ? readFileSync(file, 'utf8') : ''
+          const servers = text !== '' ? validateMcpDocument(JSON.parse(text) as { servers?: unknown }) : {}
+          sendJson(res, 200, { file, servers, revision: mcpRevision(text), restartRequired: true })
           return
         }
         if (req.method === 'POST') {
-          const body = await readJson(req) as { servers?: unknown }
+          const body = await readJsonObject(req)
           const servers = validateMcpDocument({ servers: body.servers })
+          if (typeof body.expectedRevision !== 'string') throw new RequestError(428, 'expectedRevision required; reload MCP declarations')
+          const previous = existsSync(file) ? readFileSync(file, 'utf8') : ''
+          if (body.expectedRevision !== mcpRevision(previous)) throw new RequestError(409, 'MCP declarations changed; reload before saving')
           mkdirSync(dirname(file), { recursive: true })
-          writeFileSync(file, JSON.stringify({ servers }, undefined, 2) + '\n', 'utf8')
-          sendJson(res, 200, { file, servers, restartRequired: true })
+          const text = JSON.stringify({ servers }, undefined, 2) + '\n'
+          const temporary = file + '.' + randomUUID() + '.tmp'
+          try {
+            writeFileSync(temporary, text, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+            renameSync(temporary, file)
+          } finally { rmSync(temporary, { force: true }) }
+          sendJson(res, 200, { file, servers, revision: mcpRevision(text), restartRequired: true })
           return
         }
         res.writeHead(405).end()
       } catch (err: unknown) {
-        sendJson(res, 400, { error: String(err) })
+        sendJson(res, requestErrorStatus(err), { error: String(err) })
       }
     },
   }), 'dsh-cline-host-services: mcp route')
@@ -270,6 +256,7 @@ export function registerWebGateway(
     kind: 'exact',
     path: '/dsh-cline/restart',
     handler: async (req, res) => {
+      if (!guardRequest(req, res, ['POST'])) return
       if (req.method !== 'POST') {
         res.writeHead(405).end()
         return
@@ -295,6 +282,7 @@ export function registerWebGateway(
     kind: 'exact',
     path: '/dsh-cline/ssy-login',
     handler: async (req, res) => {
+      if (!guardRequest(req, res, ['POST'])) return
       if (req.method !== 'POST') {
         res.writeHead(405).end()
         return
@@ -321,11 +309,16 @@ export function registerWebGateway(
     kind: 'exact',
     path: '/dsh-cline/ssy-account',
     handler: async (req, res) => {
+      if (!guardRequest(req, res, ['GET'])) return
       if (req.method !== 'GET') {
         res.writeHead(405).end()
         return
       }
-      const apiKey = readSsyApiKey()
+      let apiKey: string | undefined
+      try { apiKey = await readSsyApiKey(ctx) } catch {
+        sendJson(res, 503, { ok: false, reason: 'credentials', error: 'credential service unavailable' })
+        return
+      }
       if (apiKey === undefined) {
         sendJson(res, 200, { ok: false, reason: 'no-key' })
         return

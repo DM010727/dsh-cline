@@ -1,4 +1,5 @@
 import type { SidecarStatus, RuntimeStatus } from '@dsh-cline/protocol'
+import { DSH_VERSION } from './runtime'
 
 /**
  * Webview shell HTML: a CSP-fenced iframe hosting the sidecar-served DSH web
@@ -13,7 +14,8 @@ import type { SidecarStatus, RuntimeStatus } from '@dsh-cline/protocol'
  */
 export function buildShellHtml(status: SidecarStatus, version = ''): string {
   const ready = status.state === 'ready' && status.url !== undefined
-  const frameSrc = ready ? new URL(status.url as string).origin : ''
+  const browserUrl = status.browserUrl ?? status.url
+  const frameSrc = ready ? new URL(browserUrl as string).origin : ''
   const overlay = ready
     ? ''
     : [
@@ -45,20 +47,22 @@ export function buildShellHtml(status: SidecarStatus, version = ''): string {
     '</style>',
     '</head>',
     '<body>',
-    ready ? '<iframe id="dsh-frame" src="' + status.url + '"></iframe>' : '<iframe id="dsh-frame"></iframe>',
+    ready ? '<iframe id="dsh-frame" src="' + escapeHtml(browserUrl as string) + '" referrerpolicy="no-referrer"></iframe>' : '<iframe id="dsh-frame"></iframe>',
     overlay,
     '<script>',
     '(function () {',
     '  var vscode = acquireVsCodeApi();',
+    '  var frameOrigin = ' + JSON.stringify(frameSrc).replace(/</g, '\\u003c') + ';',
     '  window.addEventListener("message", function (ev) {',
+    '    var frame = document.getElementById("dsh-frame");',
     '    var data = ev.data;',
     '    if (!data || typeof data !== "object") return;',
-    '    if (data.channel === "dsh-cline.shell" && data.type === "bridge" && data.payload !== undefined) {',
-    '      var frame = document.getElementById("dsh-frame");',
-    '      if (frame && frame.contentWindow) frame.contentWindow.postMessage(data.payload, "*");',
+    '    if ((ev.source === null || ev.source === window || ev.source === window.parent) && data.channel === "dsh-cline.shell" && data.type === "bridge" && data.payload !== undefined) {',
+    '      if (frameOrigin && frame && frame.contentWindow) frame.contentWindow.postMessage(data.payload, frameOrigin);',
     '      return;',
     '    }',
-    '    if (data.channel === "dsh-cline.host-service" || (data.channel === "dsh-cline.shell" && data.type === "retry")) {',
+    '    if (!frame || ev.source !== frame.contentWindow || ev.origin !== frameOrigin) return;',
+    '    if (data.channel === "dsh-cline.host-service") {',
     '      vscode.postMessage(data);',
     '      return;',
     '    }',
@@ -81,7 +85,7 @@ function overlayTitle(status: SidecarStatus): string {
 }
 
 function escapeHtml(text: string): string {
-  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;')
 }
 
 /**
@@ -144,8 +148,7 @@ export function buildStartingHtml(status: SidecarStatus, version = ''): string {
 
 /**
  * Onboarding guide shown instead of the shell when no usable dsh runtime is
- * detected. Three cases: Node missing, dsh missing entirely, or dsh present
- * only via the npx cache (not a global install). Install actions run in a
+ * detected or dependency verification fails. Install actions run in a
  * visible VS Code terminal so the user watches progress and npm failures.
  * @param rt - latest runtime detection snapshot.
  * @returns full HTML document for `webview.html`.
@@ -153,38 +156,34 @@ export function buildStartingHtml(status: SidecarStatus, version = ''): string {
 export function buildGuideHtml(rt: RuntimeStatus, version = ''): string {
   const steps: string[] = []
   if (!rt.node) {
-    steps.push(step('1', '安装 Node.js / Install Node.js', '检测不到 Node.js（npm 依赖它）。二选一：', [
+    steps.push(step('1', '安装 Node.js / Install Node.js', '需要 Node.js 22.19+（22 系列）或 24 及以上版本。请选择：', [
       '<button data-act="install-node">在终端中安装（winget）</button>',
       '<button class="ghost" data-act="open-node-page">打开官网下载页</button>',
-      '<span class="hint">终端安装命令：winget install OpenJS.NodeJS.LTS（LTS 版本即可）</span>',
+      '<span class="hint">终端安装命令：winget install OpenJS.NodeJS.LTS。装好后请完整退出所有 VS Code 窗口并重新打开，让扩展读取新的 Node/npm PATH。</span>',
     ]))
-    steps.push(step('2', '安装 DSH / Install DSH', '装好 Node 后回到本页点击安装。', []))
+    steps.push(step('2', '安装 DSH / Install DSH', '安装 Node 后完整重启 VS Code，再按本页引导安装专用 DSH。', []))
   } else {
-    steps.push(step('1', '全局安装 DSH / Install DSH globally', '点击按钮，扩展会在 VS Code 终端中自动执行（全程可见，约 282MB）。无法访问 npmjs.org（未翻墙）请点第二个按钮走国内镜像：', [
-      '<button data-act="install">一键全局安装 DSH</button>',
+    steps.push(step('1', '安装／修复 DSH / Install or repair DSH', '扩展会在独立目录安装经过依赖校验的 DSH。安装过程在终端可见；无法访问 npmjs.org 时可选择国内镜像：', [
+      '<button data-act="install">安装／修复专用 DSH</button>',
       '<button class="ghost" data-act="install-mirror">国内镜像安装（未翻墙）</button>',
-      '<span class="hint">npm config set allow-scripts … --location=user<br>npm install -g @deepseek-ai/dsh@…<br>镜像版附加：--registry=https://registry.npmmirror.com</span>',
+      '<span class="hint">DSH ' + DSH_VERSION + ' · ~/.dsh-cline/runtime · 保留原版 DSH 配置</span>',
     ]))
   }
   steps.push(step(rt.node ? '2' : '3', '重新检测并启动 / Verify & start', '安装完成后（终端出现新的提示符即完成），点击检测：', [
     '<button data-act="recheck">重新检测并启动</button>',
   ]))
 
-  const banner = rt.via === 'npx-cache'
-    ? '<div class="banner warn">检测到 npx 缓存中的 dsh，但<b>未全局安装</b>。缓存可能被清理且版本不受控，建议全局安装。</div>'
-    : ''
-
-  const extra = rt.via === 'npx-cache'
-    ? '<button class="ghost" data-act="continue-anyway">暂时使用现有版本（不推荐）</button>'
+  const banner = rt.compatible === false
+    ? '<div class="banner warn">' + escapeHtml(rt.issue ?? ('请安装本版适配的 DSH ' + DSH_VERSION + '（next 频道）专用运行时，再重新检测。')) + '</div>'
     : ''
 
   const troubleshoot = [
     '<details class="ts"><summary>安装失败/未生效？常见排查</summary>',
     '<ul>',
-    '<li><b>终端报错 network / ECONNREFUSED</b>：代理或镜像问题，可改用国内镜像重试：<code>npm install -g @deepseek-ai/dsh --registry=https://registry.npmmirror.com</code></li>',
-    '<li><b>权限报错 EPERM / EACCES</b>：Windows 下以管理员身份运行 VS Code 后重试，或检查 npm 全局目录权限。</li>',
-    '<li><b>安装成功但检测不到</b>：完全退出并重启 VS Code（扩展宿主缓存旧 PATH），再点"重新检测"。</li>',
-    '<li><b>不想全局安装</b>：在设置中把 <code>dsh-cline.dshCommand</code> 指向任意 dsh 可执行文件的完整路径。</li>',
+    '<li><b>终端报错 network / ECONNREFUSED</b>：代理或镜像问题，可点击上方国内镜像安装按钮，安装本版适配的 DSH ' + DSH_VERSION + '。</li>',
+    '<li><b>权限报错 EPERM / EACCES</b>：先停止本工作区的旧 DSH 服务，检查独立配置目录的写入权限后重试。</li>',
+    '<li><b>安装成功但校验失败</b>：查看安装终端错误，点击安装／修复后重新检测。修改或缺失的安全补丁依赖不会被放行。</li>',
+    '<li>扩展使用独立运行时，不调用全局或 npx 缓存里的 DSH；原来的 DSH 安装保持可单独使用。</li>',
     '</ul></details>',
   ].join('')
 
@@ -224,7 +223,6 @@ export function buildGuideHtml(rt: RuntimeStatus, version = ''): string {
     '    <p class="sub">开始前需要安装 DSH 运行时。按下面步骤操作，全程在本机完成。</p>',
     '  </div>',
     banner,    ...steps,
-    extra === '' ? '' : '  <div>' + extra + '</div>',
     troubleshoot,
     version === '' ? '' : '  <div class="ver">DSH Cline v' + escapeHtml(version) + '</div>',
     '</div>',

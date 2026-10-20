@@ -74,7 +74,8 @@ function selectionProblems(): string | undefined {
   return 'Problems:\n' + lines.join('\n')
 }
 
-const MAX_MENTION_FILE_BYTES = 512 * 1024
+const MAX_MENTION_FILE_BYTES = 48 * 1024
+const MAX_PROMPT_BYTES = 60 * 1024
 
 /**
  * Cline-style @-mention expansion: replace each `@file` mention in the prompt
@@ -85,44 +86,53 @@ const MAX_MENTION_FILE_BYTES = 512 * 1024
 export async function expandMentions(prompt: string): Promise<string> {
   const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
   if (cwd === undefined) return prompt
-  const injectable: Array<{ token: string; path: string; content: string }> = []
+  const root = await fs.promises.realpath(cwd)
   const seen = new Set<string>()
-  let out = prompt.replace(/@(")?([^\s"'@]+)\1/g, (match, _quote: string, raw: string) => {
-    const token = raw
-    if (seen.has(token)) return match
-    seen.add(token)
-    const abs = path.isAbsolute(token) ? token : path.resolve(cwd, token)
-    let content: string
+  const replacements: Array<{ start: number; end: number; text: string }> = []
+  const injected: string[] = []
+  let bytes = Buffer.byteLength(prompt)
+  for (const match of prompt.matchAll(/(?<![\w.])@(?:"([^"\r\n]+)"|([^\s"'@`<>]+))/g)) {
+    const token = match[1] ?? match[2]
+    // Cline's @/foo means workspace-relative, including on Windows.
+    const candidate = path.resolve(cwd, token.startsWith('/') ? token.slice(1) : token)
     try {
-      const st = fs.statSync(abs)
-      if (!st.isFile() || st.size > MAX_MENTION_FILE_BYTES) return match
-      const buf = fs.readFileSync(abs)
-      if (buf.includes(0)) return match // binary
-      content = buf.toString('utf8')
-    } catch {
-      return match
-    }
-    const rel = path.relative(cwd, abs).split(path.sep).join('/')
-    injectable.push({ token: rel, path: '/' + rel, content })
-    return `'/${rel}'(见下)`
-  })
-  for (const item of injectable) {
-    out += `\n\n<file_content path="${item.path}">\n${item.content}\n</file_content>`
+      const abs = await fs.promises.realpath(candidate)
+      const relative = path.relative(root, abs)
+      if (relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative) || seen.has(abs)) continue
+      const st = await fs.promises.stat(abs)
+      if (!st.isFile() || st.size > MAX_MENTION_FILE_BYTES || bytes + st.size > MAX_PROMPT_BYTES) continue
+      const buf = await fs.promises.readFile(abs)
+      if (buf.includes(0)) continue
+      const rel = relative.split(path.sep).join('/')
+      const block = `\n\n<file_content path=${JSON.stringify('/' + rel)}>\n${buf.toString('utf8')}\n</file_content>`
+      if (bytes + Buffer.byteLength(block) > MAX_PROMPT_BYTES) continue
+      bytes += Buffer.byteLength(block)
+      seen.add(abs)
+      replacements.push({ start: match.index!, end: match.index! + match[0].length, text: `'/${rel}'(见下)` })
+      injected.push(block)
+    } catch { /* absent, unreadable, or outside workspace: keep the mention */ }
   }
-  return out
+  let out = prompt
+  for (const replacement of replacements.reverse()) {
+    out = out.slice(0, replacement.start) + replacement.text + out.slice(replacement.end)
+  }
+  return out + injected.join('')
 }
 
 /** POST a prompt to the DSH-side task route and return its result. */
-export async function sendTask(prompt: string, dshUrl: string, cwd?: string): Promise<{ ok: boolean; error?: string }> {
+export async function sendTask(prompt: string, dshUrl: string, cwd?: string): Promise<{ ok: boolean; error?: string; sessionId?: string }> {
   const base = dshUrl.replace(/\/+$/, '')
+  if (Buffer.byteLength(JSON.stringify({ content: prompt, cwd })) > 64 * 1024) return { ok: false, error: '所选内容超过 64 KiB，请缩小选择范围。' }
   try {
     const res = await fetch(base + '/dsh-cline/task', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ content: prompt, cwd }),
+      signal: AbortSignal.timeout(30_000),
     })
+    if (!res.ok) return { ok: false, error: 'DSH task HTTP ' + res.status }
     const data = await res.json() as { ok?: boolean; error?: string; sessionId?: string }
-    return { ok: data.ok === true, error: data.error }
+    return { ok: data.ok === true, error: data.error, sessionId: data.sessionId }
   } catch (err: unknown) {
     return { ok: false, error: String(err) }
   }

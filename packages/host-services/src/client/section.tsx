@@ -1,24 +1,23 @@
 /**
  * The「DSH Cline」settings section: the fusion-feature configuration after the
- * model/provider unification (v0.9.0 - keys and models live ONLY in the
- * 「模型」section). Cards: the edit-diff mirror, checkpoint policy, MCP server
+ * feature configuration. Cards: the edit-diff mirror, checkpoint policy, MCP server
  * management (file-backed, applies on next boot), the DSH service card
  * (bridge health + in-GUI restart), and about. Reads/writes travel through the
  * plugin's same-origin gateway to the VS Code configuration, the DSH
  * settings/credential wire APIs, and the mcp.json file.
  */
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import type { IApiClient } from '@deepseek-ai/dsh-api-remotes/client'
+import type { ClientApi } from './api.ts'
 import {
-  fetchMcpServers, probeProviders, readVscodeConfig, restartDshService, writeMcpServers,
+  fetchMcpServers, readVscodeConfig, restartDshService, writeMcpServers,
   writeVscodeConfig, type McpServerEntry, type McpServerRow,
 } from './shared.ts'
 
 /** Face the registration injects. */
 export interface DshClineSectionInjected {
-  api: IApiClient
+  api: ClientApi
 }
 
 /** Owner props the settings shell hands each section. */
@@ -34,6 +33,18 @@ const CHECKPOINT_LABELS: Record<CheckpointAuto, string> = {
   'all': '所有工具调用前',
 }
 
+function waitForRestart(signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const abort = (): void => {
+      clearTimeout(timer)
+      reject(new DOMException('Restart cancelled', 'AbortError'))
+    }
+    const timer = setTimeout(() => { signal.removeEventListener('abort', abort); resolve() }, 3_000)
+    if (signal.aborted) { abort(); return }
+    signal.addEventListener('abort', abort, { once: true })
+  })
+}
+
 /** One MCP row merged with its name (the file maps name -> entry). */
 type McpRow = McpServerRow
 
@@ -46,12 +57,20 @@ export function DshClineSection(props: DshClineSectionProps): ReactNode {
   const [diffOnEdit, setDiffOnEdit] = useState<boolean | undefined>(undefined)
   const [diffBusy, setDiffBusy] = useState(false)
   const [checkpointAuto, setCheckpointAuto] = useState<CheckpointAuto | undefined>(undefined)
-  const [ssyKeyed, setSsyKeyed] = useState<boolean | undefined>(undefined)
+  const [checkpointBusy, setCheckpointBusy] = useState(false)
   const [error, setError] = useState<string | undefined>(undefined)
   const [health, setHealth] = useState<string | undefined>(undefined)
 
   const [mcpRows, setMcpRows] = useState<McpRow[] | undefined>(undefined)
   const [mcpBusy, setMcpBusy] = useState(false)
+  const [mcpRevision, setMcpRevision] = useState<string | undefined>(undefined)
+  const active = useRef(true)
+  const mcpGeneration = useRef(0)
+  const restartController = useRef<AbortController | undefined>(undefined)
+  useEffect(() => {
+    active.current = true
+    return () => { active.current = false; restartController.current?.abort() }
+  }, [])
   const [mcpAdding, setMcpAdding] = useState(false)
   const [mcpName, setMcpName] = useState('')
   const [mcpTransport, setMcpTransport] = useState<'stdio' | 'streamable-http'>('stdio')
@@ -62,9 +81,14 @@ export function DshClineSection(props: DshClineSectionProps): ReactNode {
   const [restartNote, setRestartNote] = useState<string | undefined>(undefined)
 
   const reloadMcp = useCallback((): Promise<void> => {
+    const generation = ++mcpGeneration.current
     return fetchMcpServers().then(
-      rows => { setMcpRows(rows) },
-      err => { setError(String(err)) },
+      value => {
+        if (!active.current || generation !== mcpGeneration.current) return
+        setMcpRows(value.rows)
+        setMcpRevision(value.revision)
+      },
+      err => { if (active.current && generation === mcpGeneration.current) setError(String(err)) },
     )
   }, [])
 
@@ -74,10 +98,10 @@ export function DshClineSection(props: DshClineSectionProps): ReactNode {
       v => { if (!cancelled) setDiffOnEdit(v !== false) },
       err => { if (!cancelled) setError(String(err)) },
     )
-    void api.settings.describe({}).then(
+    void api.settings.describe().then(
       response => {
-        if (cancelled || !response.result.ok) return
-        const ns = response.result.value.namespaces.find(n => n.ns === 'dsh-cline-host-services')
+        if (cancelled || !response.ok) return
+        const ns = response.value.namespaces.find(n => n.ns === 'dsh-cline-host-services')
         const value = ns?.value
         const mode = (typeof value === 'object' && value !== null
           ? (value as { checkpointAuto?: unknown }).checkpointAuto
@@ -86,18 +110,15 @@ export function DshClineSection(props: DshClineSectionProps): ReactNode {
       },
       () => { /* namespace absent: plugin config stays at its base default */ },
     )
-    void probeProviders(api).then(
-      ({ ssyKeyed }) => { if (!cancelled) setSsyKeyed(ssyKeyed) },
-      () => { /* status stays unknown */ },
-    )
-    void fetch('/dsh-cline/health').then(
+    void fetch('dsh-cline/health').then(
       async response => {
         if (cancelled) return
         try {
           const body = await response.json() as { bridge?: string; extensionVersion?: string; error?: string }
+          if (cancelled) return
           if (body.bridge === 'up') setHealth('桥已连接 · 扩展 v' + String(body.extensionVersion ?? '?'))
           else setHealth('桥未连接（' + String(body.error ?? 'bridge down') + '）')
-        } catch { setHealth('桥未连接') }
+        } catch { if (!cancelled) setHealth('桥未连接') }
       },
       () => { if (!cancelled) setHealth('桥未连接') },
     )
@@ -121,39 +142,44 @@ export function DshClineSection(props: DshClineSectionProps): ReactNode {
   }
 
   const setCheckpoint = async (next: CheckpointAuto): Promise<void> => {
-    setCheckpointAuto(next)
+    if (checkpointBusy) return
+    setCheckpointBusy(true)
     setError(undefined)
     try {
-      const described = await api.settings.describe({})
-      if (!described.result.ok) throw new Error(described.result.error.message)
-      const ns = described.result.value.namespaces.find(n => n.ns === 'dsh-cline-host-services')
-      const response = await api.settings.mutate({
-        ns: 'dsh-cline-host-services',
-        ops: [{ op: 'set', path: ['checkpointAuto'], value: next }],
-        ...(ns?.revision === undefined ? {} : { expectedRevision: ns.revision }),
-      })
-      if (!response.result.ok) throw new Error(response.result.error.message)
+      const described = await api.settings.describe()
+      if (!described.ok) throw new Error(described.error.message)
+      const ns = described.value.namespaces.find(n => n.ns === 'dsh-cline-host-services')
+      if (!described.value.writable || ns === undefined) throw new Error('检查点配置不可写')
+      const response = await api.settings.mutate('dsh-cline-host-services',
+        [{ op: 'set', path: ['checkpointAuto'], value: next }], ns.revision)
+      if (!response.ok) throw new Error(response.error.message)
+      setCheckpointAuto(next)
     } catch (err) {
       setError(String(err))
+    } finally {
+      setCheckpointBusy(false)
     }
   }
 
   /** Write the whole mcp.json back with one row changed. */
-  const writeMcp = async (mutate: (servers: Record<string, McpServerEntry>) => void): Promise<void> => {
-    if (mcpRows === undefined || mcpBusy) return
+  const writeMcp = async (mutate: (servers: Record<string, McpServerEntry>) => void): Promise<boolean> => {
+    if (mcpRows === undefined || mcpRevision === undefined || mcpBusy) return false
     setMcpBusy(true)
     setError(undefined)
     try {
-      const servers: Record<string, McpServerEntry> = {}
+      const servers: Record<string, McpServerEntry> = Object.create(null) as Record<string, McpServerEntry>
       for (const row of mcpRows) {
         const { name, ...entry } = row
         servers[name] = entry
       }
       mutate(servers)
-      await writeMcpServers(servers)
+      await writeMcpServers(servers, mcpRevision)
       await reloadMcp()
+      return true
     } catch (err) {
       setError(String(err))
+      await reloadMcp()
+      return false
     } finally {
       setMcpBusy(false)
     }
@@ -162,6 +188,14 @@ export function DshClineSection(props: DshClineSectionProps): ReactNode {
   const addMcp = async (): Promise<void> => {
     const name = mcpName.trim()
     if (name === '' || mcpBusy) return
+    if (['__proto__', 'constructor', 'prototype'].includes(name)) {
+      setError('请使用其他 MCP 服务器名称')
+      return
+    }
+    if (mcpRows?.some(row => row.name === name)) {
+      setError('该 MCP 服务器名称已存在，请使用其他名称')
+      return
+    }
     if (mcpTransport === 'stdio' && mcpCommand.trim() === '') {
       setError('stdio 服务器需要 command')
       return
@@ -170,11 +204,12 @@ export function DshClineSection(props: DshClineSectionProps): ReactNode {
       setError('http 服务器需要以 http(s) 开头的 url')
       return
     }
-    await writeMcp(servers => {
+    const saved = await writeMcp(servers => {
       servers[name] = mcpTransport === 'stdio'
         ? { transport: 'stdio', command: mcpCommand.trim() }
         : { transport: 'streamable-http', url: mcpUrl.trim() }
     })
+    if (!saved) return
     setMcpAdding(false)
     setMcpName('')
     setMcpCommand('')
@@ -185,28 +220,44 @@ export function DshClineSection(props: DshClineSectionProps): ReactNode {
   const restart = async (): Promise<void> => {
     if (restartBusy) return
     setRestartBusy(true)
-    setRestartNote('重启请求已发送，等待服务恢复…')
+    setRestartNote('正在请求重启…')
     setError(undefined)
+    const controller = new AbortController()
+    restartController.current = controller
+    const fetchHealth = async (): Promise<{ bridge?: string; instanceId?: string }> => {
+      const response = await fetch('dsh-cline/health', {
+        signal: AbortSignal.any([controller.signal, AbortSignal.timeout(5_000)]),
+      })
+      if (!response.ok) throw new Error('服务健康检查失败')
+      return await response.json() as { bridge?: string; instanceId?: string }
+    }
     try {
+      const before = await fetchHealth()
+      if (typeof before.instanceId !== 'string') throw new Error('服务健康检查缺少实例标识，请在 VS Code 重启 DSH 服务')
       await restartDshService()
-      // The old process dies and a fresh one boots (cold boot can take a
-      // minute); poll the health route until the carrier answers again.
+      setRestartNote('重启请求已发送，等待服务恢复…')
       const deadline = Date.now() + 180_000
-      for (;;) {
-        await new Promise(resolve => { setTimeout(resolve, 3_000) })
-        if (Date.now() > deadline) break
+      while (Date.now() < deadline) {
+        await waitForRestart(controller.signal)
         try {
-          const response = await fetch('/dsh-cline/health')
-          if (response.ok) break
+          const health = await fetchHealth()
+          if (health.bridge === 'up' && typeof health.instanceId === 'string' && health.instanceId !== before.instanceId) {
+            if (!active.current || controller.signal.aborted) return
+            window.location.reload()
+            return
+          }
         } catch { /* still down */ }
+        if (controller.signal.aborted) return
       }
-      setRestartNote('服务已恢复，正在刷新页面…')
-      setTimeout(() => { window.location.reload() }, 800)
+      throw new Error('等待 DSH 重启超时，请检查「DSH Cline 服务」终端或在 VS Code 重试')
     } catch (err) {
-      setError(String(err))
-      setRestartNote(undefined)
+      if (active.current && !controller.signal.aborted) {
+        setError(String(err))
+        setRestartNote(undefined)
+      }
     } finally {
-      setRestartBusy(false)
+      if (active.current) setRestartBusy(false)
+      if (restartController.current === controller) restartController.current = undefined
     }
   }
 
@@ -237,7 +288,7 @@ export function DshClineSection(props: DshClineSectionProps): ReactNode {
               key={mode}
               type="button"
               className={checkpointAuto === mode ? 'on' : ''}
-              disabled={checkpointAuto === undefined}
+              disabled={checkpointAuto === undefined || checkpointBusy}
               onClick={() => { void setCheckpoint(mode) }}
             >
               {CHECKPOINT_LABELS[mode]}
@@ -336,7 +387,7 @@ export function DshClineSection(props: DshClineSectionProps): ReactNode {
             </div>
           )
           : (
-            <button type="button" className="dshc-btn ghost" disabled={mcpBusy} onClick={() => { setMcpAdding(true) }}>
+            <button type="button" className="dshc-btn ghost" disabled={mcpBusy || mcpRows === undefined} onClick={() => { setMcpAdding(true) }}>
               + 添加 MCP 服务器
             </button>
           )}
@@ -358,11 +409,7 @@ export function DshClineSection(props: DshClineSectionProps): ReactNode {
       <div className="dshc-card">
         <h3>关于</h3>
         <p className="dshc-status">
-          {'默认供应商：胜算云 · '}
-          <span className={ssyKeyed === undefined ? '' : ssyKeyed ? 'dshc-status ok' : 'dshc-status bad'}>
-            {ssyKeyed === undefined ? '状态未知' : ssyKeyed ? 'API Key 已配置' : 'API Key 未配置'}
-          </span>
-          {'（在「模型」页配置）'}
+          模型与供应商在「模型」页统一管理。胜算云登录入口位于其供应商卡片中。
         </p>
         <p className="dshc-hint">DSH Cline：DSH 终端常驻运行 + VS Code 深度集成（方案 F）。</p>
       </div>

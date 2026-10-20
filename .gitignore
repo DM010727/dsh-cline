@@ -2,3 +2,7 @@ node_modules/
 dist/
 *.vsix
 .DS_Store
+
+# Generated files are rebuilt from public source only.
+packages/host-services/lib/
+*.map

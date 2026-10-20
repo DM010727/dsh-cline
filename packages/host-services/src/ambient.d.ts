@@ -26,3 +26,8 @@ declare module '@deepseek-ai/dsh-agent' {
     options: { current: { provider: string; model: string }; assembled: unknown },
   ): void
 }
+
+declare module '@deepseek-ai/dsh-credentials' {
+  /** Brand the public credential reference resolved by ctx.credentials. */
+  export function credentialRef(value: string): unknown
+}

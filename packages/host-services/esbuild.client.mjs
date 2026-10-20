@@ -12,10 +12,7 @@ import { build } from 'esbuild'
 const PLATFORM_MODULES = [
   'react', 'react/jsx-runtime', 'react-dom', 'react-dom/client', '@deepseek-ai/cordis',
   '@deepseek-ai/dsh-client-ui-slots',
-  '@deepseek-ai/dsh-client-web-react',
   '@deepseek-ai/dsh-client-ui-primitives',
-  '@deepseek-ai/dsh-client-ui-attachment',
-  '@deepseek-ai/dsh-client-schema-form',
 ]
 
 const ID = '@dsh-cline/host-services'

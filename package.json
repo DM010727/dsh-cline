@@ -8,11 +8,11 @@
     "node": "^22.19.0 || >=24.0.0"
   },
   "scripts": {
-    "build": "pnpm -r --if-present run build",
+    "build": "pnpm --filter @dsh-cline/host-services build && pnpm --filter cline-shengsuan build",
     "typecheck": "pnpm -r --if-present run typecheck",
-    "watch": "pnpm --filter dsh-cline run watch"
+    "watch": "pnpm --filter cline-shengsuan watch"
   },
   "devDependencies": {
-    "@vscode/vsce": "^3.9.2"
+    "@vscode/vsce": "^4.0.0"
   }
 }

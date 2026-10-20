@@ -1,0 +1,9 @@
+{
+  "version": "0.8.3",
+  "registryIntegrity": "sha512-tbZNuJrLwGUp3zshBtdy4W+ORxZuIh8a5ilyIEQDC5rY1f3U20JMry0Ll3WBzU58EZKsEuJFXhb5gwv8CsPvgA==",
+  "sha256": {
+    "package.json": "5922d8150b307bc0e4e441491c779c45379e9913d348848fca8d5cf02db4d134",
+    "esm/index.mjs": "8d75534a30a0580608e1271c13d70943ed4cd3589fddff7b1197748036a5116e",
+    "lib/node.cjs": "befa44cd80a1da830179db9e57930050a2e460ca3df13f0b05f83f52b1491818"
+  }
+}

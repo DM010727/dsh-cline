@@ -15,9 +15,11 @@ import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, relative } from 'node:path'
 import { promisify } from 'node:util'
 import type { Context, ToolDispatchExecution, ToolExecutionResult } from '@deepseek-ai/cordis'
+import { guardRequest, readJsonObject, requestErrorStatus, sendJson } from './request-guard.js'
+import { canonicalPath, executionCwd, isWithinWorkspace } from './workspace-context.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -26,6 +28,18 @@ const GIT_TIMEOUT_MS = 15_000
 
 /** Dirs never snapshotted (written to the shadow repo's info/exclude). */
 const DEFAULT_EXCLUDES = ['node_modules/', '.venv/', '__pycache__/', '.next/', 'target/']
+const storeChains = new Map<string, Promise<unknown>>()
+const workspaceChains = new Map<string, Promise<unknown>>()
+
+/** Keep restoration and mutating tools from rewriting the same tree concurrently. */
+function serializeWorkspace<T>(root: string, task: () => Promise<T>): Promise<T> {
+  const key = canonicalPath(root)
+  const next = (workspaceChains.get(key) ?? Promise.resolve()).then(task, task)
+  const settled = next.catch(() => undefined)
+  workspaceChains.set(key, settled)
+  void settled.then(() => { if (workspaceChains.get(key) === settled) workspaceChains.delete(key) })
+  return next
+}
 
 /** One checkpoint as listed to callers. */
 export interface CheckpointEntry {
@@ -38,14 +52,14 @@ export interface CheckpointEntry {
 /** Shadow-git checkpoint store bound to one workspace root. */
 export class CheckpointStore {
   private readonly dir: string
-  private chain: Promise<unknown> = Promise.resolve()
   private initialized = false
 
   /**
    * @param workspaceRoot - absolute path bound as the shadow repo's worktree.
    */
   constructor(private readonly workspaceRoot: string) {
-    const key = createHash('sha1').update(workspaceRoot).digest('hex').slice(0, 12)
+    this.workspaceRoot = canonicalPath(workspaceRoot)
+    const key = createHash('sha1').update(this.workspaceRoot).digest('hex').slice(0, 12)
     this.dir = join(dshClineHome(), 'checkpoints', key)
   }
 
@@ -53,31 +67,42 @@ export class CheckpointStore {
   private async ensure(): Promise<void> {
     if (this.initialized) return
     if (!existsSync(this.dir)) mkdirSync(this.dir, { recursive: true })
-    if (!existsSync(join(this.dir, 'config'))) {
+    if (!existsSync(join(this.dir, '.git', 'config'))) {
       await this.git('init', '--quiet')
       await this.git('config', 'core.worktree', this.workspaceRoot)
       await this.git('config', 'user.email', 'checkpoint@dsh-cline.local')
       await this.git('config', 'user.name', 'dsh-cline checkpoint')
-      const exclude = join(this.dir, 'info')
-      if (!existsSync(exclude)) mkdirSync(exclude, { recursive: true })
-      writeFileSync(join(exclude, 'exclude'), DEFAULT_EXCLUDES.join('\n') + '\n')
     }
+    await this.git('config', 'core.worktree', this.workspaceRoot)
+    const exclude = join(this.dir, '.git', 'info')
+    mkdirSync(exclude, { recursive: true })
+    const excludeFile = join(exclude, 'exclude')
+    const previous = existsSync(excludeFile) ? readFileSync(excludeFile, 'utf8') : ''
+    const ownDirectory = isWithinWorkspace(this.dir, this.workspaceRoot)
+      ? ['/' + relative(this.workspaceRoot, this.dir).replaceAll('\\', '/') + '/'] : []
+    const missing = [...DEFAULT_EXCLUDES, ...ownDirectory].filter(line => !previous.split(/\r?\n/).includes(line))
+    if (missing.length > 0) writeFileSync(excludeFile, previous + '\n' + missing.join('\n') + '\n')
     this.initialized = true
   }
 
   /** Serialize every git invocation; callers get ordered semantics. */
   private queue<T>(task: () => Promise<T>): Promise<T> {
-    const next = this.chain.then(task, task)
-    this.chain = next.catch(() => undefined)
+    const next = (storeChains.get(this.dir) ?? Promise.resolve()).then(task, task)
+    const settled = next.catch(() => undefined)
+    storeChains.set(this.dir, settled)
+    void settled.then(() => { if (storeChains.get(this.dir) === settled) storeChains.delete(this.dir) })
     return next
   }
 
   private async git(...args: string[]): Promise<string> {
     const env = { ...process.env } as Record<string, string | undefined>
-    delete env.GIT_DIR
-    delete env.GIT_WORK_TREE
-    delete env.GIT_INDEX_FILE
-    const { stdout } = await execFileAsync('git', ['-C', this.dir, ...args], {
+    for (const key of Object.keys(env)) if (key.startsWith('GIT_')) delete env[key]
+    const { stdout } = await execFileAsync('git', [
+      '-c', 'core.hooksPath=' + join(this.dir, 'disabled-hooks'),
+      '-c', 'commit.gpgsign=false',
+      '-C', this.dir, '--git-dir=' + join(this.dir, '.git'), '--work-tree=' + this.workspaceRoot,
+      ...args,
+    ], {
       cwd: this.dir,
       timeout: GIT_TIMEOUT_MS,
       maxBuffer: 64 * 1024 * 1024,
@@ -93,12 +118,16 @@ export class CheckpointStore {
    * @returns the short commit hash, or undefined when nothing changed.
    */
   snapshot(label: string): Promise<string | undefined> {
+    const subject = label.replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 200).trim() || 'manual'
     return this.queue(async () => {
       await this.ensure()
       await this.git('add', '-A')
       const diff = await this.git('diff', '--cached', '--name-only')
-      if (diff.trim() === '') return undefined
-      await this.git('commit', '--quiet', '-m', label)
+      if (diff.trim() === '') {
+        const hasHead = await this.git('rev-parse', '--verify', 'HEAD').then(() => true, () => false)
+        if (hasHead) return undefined
+      }
+      await this.git('commit', '--quiet', '--allow-empty', '-m', subject)
       return (await this.git('rev-parse', '--short', 'HEAD')).trim()
     })
   }
@@ -109,6 +138,7 @@ export class CheckpointStore {
    * @returns newest-first checkpoint entries; empty before the first snapshot.
    */
   list(limit: number): Promise<CheckpointEntry[]> {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 50) return Promise.reject(new Error('checkpoint limit must be between 1 and 50'))
     return this.queue(async () => {
       await this.ensure()
       let raw: string
@@ -133,7 +163,16 @@ export class CheckpointStore {
   restore(id: string): Promise<void> {
     return this.queue(async () => {
       await this.ensure()
-      await this.git('read-tree', '-u', '--reset', id)
+      if (!/^[a-fA-F0-9]{7,64}$/.test(id)) throw new Error('checkpoint id must be a commit hash returned by list')
+      const commit = (await this.git('rev-parse', '--verify', id + '^{commit}')).trim()
+      await this.git('merge-base', '--is-ancestor', commit, 'HEAD')
+      // Checkpoint the current tree before destructive restoration so accidental
+      // restores remain recoverable. This runs inside the same serialized job.
+      await this.git('add', '-A')
+      if ((await this.git('diff', '--cached', '--name-only')).trim() !== '') {
+        await this.git('commit', '--quiet', '-m', 'before restore ' + id)
+      }
+      await this.git('read-tree', '-u', '--reset', commit)
       await this.git('clean', '-fd')
     })
   }
@@ -148,25 +187,37 @@ export class CheckpointStore {
  */
 export function registerCheckpoint(ctx: Context, auto: () => 'off' | 'edit-only' | 'all'): void {
   const workspaceRoot = process.cwd()
-  const store = new CheckpointStore(workspaceRoot)
+  const stores = new Map<string, CheckpointStore>()
+  const storeFor = (cwd: string): CheckpointStore => {
+    if (!isWithinWorkspace(cwd, workspaceRoot)) throw new Error('checkpoint directory is outside this VS Code workspace')
+    const key = canonicalPath(cwd)
+    let store = stores.get(key)
+    if (store === undefined) { store = new CheckpointStore(key); stores.set(key, store) }
+    return store
+  }
+  const store = storeFor(workspaceRoot)
 
   ctx.on('tools/execute', async (exec: ToolDispatchExecution, next: () => Promise<ToolExecutionResult>) => {
-    const mode = auto()
-    const mutating = mode === 'all'
-      ? ['edit', 'write', 'bash', 'pwsh']
-      : ['edit', 'write']
-    if (mode !== 'off' && mutating.includes(exec.name)) {
-      await store.snapshot('auto before ' + exec.name).catch(err => {
-        ctx.logger.warn('checkpoint snapshot failed: ' + String(err))
-      })
-    }
-    return next()
+    if (!['edit', 'write', 'str_replace_editor', 'apply_patch', 'bash', 'pwsh', 'checkpoint'].includes(exec.name)) return next()
+    return serializeWorkspace(workspaceRoot, async () => {
+      if (exec.signal.aborted) return next()
+      const mode = auto()
+      const mutating = mode === 'all'
+        ? ['edit', 'write', 'str_replace_editor', 'apply_patch', 'bash', 'pwsh']
+        : ['edit', 'write', 'str_replace_editor', 'apply_patch']
+      if (mode !== 'off' && mutating.includes(exec.name)) {
+        await Promise.resolve().then(() => storeFor(executionCwd(ctx, exec.agent)).snapshot('auto before ' + exec.name)).catch(err => {
+          ctx.logger.warn('checkpoint snapshot failed: ' + String(err))
+        })
+      }
+      return next()
+    })
   })
 
   ctx.systemPrompt.section({
     name: 'tool:checkpoint',
     order: 113,
-    text: 'The checkpoint tool snapshots and restores the workspace (shadow git under ~/.dsh/dsh-cline/checkpoints). Create one before risky bulk changes; restore rolls files back to a snapshot (destructive: post-snapshot files are removed).',
+    text: 'The checkpoint tool snapshots and restores the current session directory within this VS Code workspace (shadow git under $DSH_HOME/dsh-cline/checkpoints). Create one before risky bulk changes; restore rolls files back to a snapshot (destructive: post-snapshot files are removed).',
   })
 
   ctx.tools.register({
@@ -196,7 +247,8 @@ export function registerCheckpoint(ctx: Context, auto: () => 'off' | 'edit-only'
       },
       render: (_args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value) }],
     },
-    async execute(args: unknown): Promise<unknown> {
+    async execute(args: unknown, exec): Promise<unknown> {
+      const store = storeFor(executionCwd(ctx, exec.agent))
       const a = (args ?? {}) as { action?: unknown, label?: unknown, id?: unknown, limit?: unknown }
       if (a.action === 'create') {
         const label = typeof a.label === 'string' && a.label !== '' ? a.label : 'manual'
@@ -204,7 +256,7 @@ export function registerCheckpoint(ctx: Context, auto: () => 'off' | 'edit-only'
         return { done: true, action: 'create', detail: hash === undefined ? 'unchanged since last checkpoint' : hash }
       }
       if (a.action === 'list') {
-        const limit = typeof a.limit === 'number' ? Math.min(Math.max(Math.trunc(a.limit), 1), 50) : 10
+        const limit = typeof a.limit === 'number' && Number.isFinite(a.limit) ? Math.min(Math.max(Math.trunc(a.limit), 1), 50) : 10
         const entries = await store.list(limit)
         return { done: true, action: 'list', detail: entries.length === 0 ? 'none' : JSON.stringify(entries) }
       }
@@ -223,42 +275,27 @@ export function registerCheckpoint(ctx: Context, auto: () => 'off' | 'edit-only'
       kind: 'exact',
       path: '/dsh-cline/checkpoints',
       handler: async (req, res) => {
+        if (!guardRequest(req, res, ['GET', 'POST'], true)) return
         try {
           if (req.method === 'GET') {
-            const entries = await store.list(20)
-            res.writeHead(200, { 'content-type': 'application/json' })
-            res.end(JSON.stringify({ workspace: workspaceRoot, checkpoints: entries }))
+            const entries = await serializeWorkspace(workspaceRoot, () => store.list(20))
+            sendJson(res, 200, { workspace: workspaceRoot, checkpoints: entries })
             return
           }
           if (req.method === 'POST') {
-            const body = await readBody(req)
-            const parsed = JSON.parse(body) as { id?: unknown }
+            const parsed = await readJsonObject(req)
             if (typeof parsed.id !== 'string' || parsed.id === '') throw new Error('id required')
-            await store.restore(parsed.id)
-            res.writeHead(200, { 'content-type': 'application/json' })
-            res.end(JSON.stringify({ restored: parsed.id }))
+            await serializeWorkspace(workspaceRoot, () => store.restore(parsed.id as string))
+            sendJson(res, 200, { restored: parsed.id })
             return
           }
           res.writeHead(405).end()
         } catch (err: unknown) {
-          res.writeHead(500, { 'content-type': 'application/json' })
-          res.end(JSON.stringify({ error: String(err) }))
+          sendJson(res, requestErrorStatus(err), { error: String(err) })
         }
       },
     }), 'dsh-cline-host-services: checkpoints route')
   }
-}
-
-/** Read one request body as text with a hard size cap. */
-async function readBody(req: AsyncIterable<Buffer | string>): Promise<string> {
-  let body = ''
-  let bytes = 0
-  for await (const chunk of req) {
-    bytes += chunk.length
-    if (bytes > 64 * 1024) throw new Error('body too large')
-    body += chunk.toString('utf8')
-  }
-  return body
 }
 
 /** The dsh-cline home under DSH home. */

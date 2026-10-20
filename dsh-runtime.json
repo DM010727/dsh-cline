@@ -1,0 +1,12 @@
+{
+  "version": "0.2.1-rc.2",
+  "channel": "next",
+  "verifiedOn": "2026-10-19",
+  "gitTag": "dsh-v0.2.1-rc.2",
+  "gitCommit": "687f282e8625c6b8d11ff58211a90524be2e4317",
+  "npmIntegrity": "sha512-tvY+yhfKRifthbqPe/OK0AYxM5ZkvqfYq/jMYgJcEUxiRRL1Vwra3Ti5TB6AXgSWQdiPHYh/Vp6SJa9yHwMNuw==",
+  "npmSha256": "40e3d025c0240c4316ff42dee9bedc7709c0fb38aea10543b47076ed2af52e1d",
+  "runtimeRevision": "0.2.1-rc.2-r1",
+  "fflateOverride": "0.8.3",
+  "runtimeLockSha256": "96ead728cce91d0dbd8e80bd0fe04813b7ff1f71c9d22b89fb684d1378a44963"
+}

@@ -1,45 +1,20 @@
-/**
- * @dsh-cline/host-services browser half. Ships inside the DSH web client as a
- * static dual-face plugin (package.json `dsh.client`): registers the
- * Shengsuanyun onboarding step (shadowing the official DeepSeek step under the
- * same slot id at a lower priority), the「模型」section (shadowing DSH's native
- * one the same way - Shengsuanyun is the default provider and the single
- * place keys/models are configured), the「DSH Cline」fusion-feature section,
- * and the sidebar brand re-label. All data moves either through the DSH wire
- * APIs (settings/credentials/llm) or the plugin's own same-origin gateway
- * routes (model catalog, VS Code configuration, MCP declarations, restart,
- * external links).
- *
- * @module @dsh-cline/host-services/client
- */
-
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
-import type { ConnectionHandle } from '@deepseek-ai/dsh-api-remotes/client'
-import { SsyOnboarding } from './onboarding.tsx'
+/** DSH keeps its official DeepSeek onboarding and complete native Models page. */
+import type { ClientContext } from './api.ts'
 import { DshClineSection } from './section.tsx'
-import { DshClineModelsSection } from './models-section.tsx'
+import { SsyModelsFooter } from './ssy-provider-setup.tsx'
+import { SsyProviderCard } from './ssy-provider-card.tsx'
 import { CLIENT_CSS } from './styles.ts'
 import { installClipboard } from './clipboard.ts'
+import { pathOf } from './shared.ts'
+import { installWorkspaceBinding } from './workspace-binding.ts'
 
-/** Required services (cordis fiber inject, same contract as ui-settings-models). */
-export const inject = ['slots', 'locale', 'connection', 'remote', 'theme']
-
-/** localStorage flag: the first-run dark-theme default has been applied. */
+export const inject = ['slots', 'locale', 'theme', 'remote', 'remote.settings', 'remote.credentials', 'uiWorkspace', 'commandUi', 'workspaces', 'sessions', 'layout']
 const THEME_DEFAULTED_KEY = 'dsh-cline.theme-defaulted'
+const LOCALE_DEFAULTED_KEY = 'dsh-cline.locale-defaulted'
 
-/** Nav labels the native「模型」section may render as (zh + en). */
-const MODELS_NAV_LABELS = new Set(['模型', 'Models'])
-
-/**
- * Mount every DSH Cline browser surface.
- * @param ctx - client root context.
- */
 export function apply(ctx: ClientContext): void {
-  // Clipboard bridge + right-click menu for the DSH inputs (webview iframe
-  // swallows native Cmd/Ctrl+C/V and the native context menu; see clipboard.ts).
-  installClipboard()
-
-  // One style tag for all hand-prefixed classes plus the brand re-label.
+  ctx.effect(installClipboard, 'dsh-cline: clipboard bridge')
+  ctx.effect(() => installWorkspaceBinding(ctx), 'dsh-cline: project and session navigation')
   ctx.effect(() => {
     const tag = document.createElement('style')
     tag.dataset.plugin = '@dsh-cline/host-services'
@@ -48,90 +23,42 @@ export function apply(ctx: ClientContext): void {
     return () => { tag.remove() }
   }, 'dsh-cline: stylesheet')
 
-  // First-run default: dark theme. DSH ships preference `system`, so a light
-  // OS gets a light GUI on first boot; DSH Cline's product default is dark.
-  // Applied once (flag in localStorage) and only while the preference is the
-  // untouched `system` - a deliberate user choice is never overridden. The
-  // write itself is the theme service's normal setTheme, persisted through the
-  // settings scope (settings.theme.preference) like the Appearance row does.
+  const api = ctx.remote
   ctx.effect(() => {
-    try {
-      if (localStorage.getItem(THEME_DEFAULTED_KEY) === null) {
-        if (ctx.theme.getTheme().preference === 'system') ctx.theme.setTheme('dark')
-        localStorage.setItem(THEME_DEFAULTED_KEY, '1')
+    let disposed = false
+    void api.settings.describe().then(described => {
+      if (disposed || !described.ok) return
+      try {
+        const namespaces = described.value.namespaces
+        if (localStorage.getItem(THEME_DEFAULTED_KEY) === null) {
+          // An explicit system preference is still a deliberate choice.
+          const theme = namespaces.find(ns => ns.ns === 'ui-theme')
+          if (theme !== undefined && pathOf(theme.user, ['preference']) === undefined
+            && ctx.theme.getTheme().preference === 'system') ctx.theme.setTheme('dark')
+          localStorage.setItem(THEME_DEFAULTED_KEY, '1')
+        }
+        if (localStorage.getItem(LOCALE_DEFAULTED_KEY) === null) {
+          const locale = namespaces.find(ns => ns.ns === 'locale')
+          if (pathOf(locale?.value, ['preference']) === undefined
+            && ctx.locale.getLocale().active !== 'zh') ctx.locale.setLocale('zh')
+          localStorage.setItem(LOCALE_DEFAULTED_KEY, '1')
+        }
+      } catch (error: unknown) {
+        ctx.logger.warn('dsh-cline: initial appearance preferences skipped: ' + String(error))
       }
-    } catch (err: unknown) {
-      // Storage or theme write failed: leave the flag unset so the next GUI
-      // load retries, and never block the rest of the surfaces over a default.
-      ctx.logger.warn('dsh-cline client: dark-theme default skipped: ' + String(err))
-    }
-    return undefined
-  }, 'dsh-cline: first-run dark theme')
+    }).catch(() => { /* connection not ready: leave one-time flags unset */ })
+    return () => { disposed = true }
+  }, 'dsh-cline: first-run appearance')
 
-  // Nav dedupe: the settings shell renders its nav from the RAW slot ledger,
-  // so our priority -1 models shadow cannot remove the native「模型」row (the
-  // slot API exposes no disposer for another registrant's entry). What it CAN
-  // do is hide the duplicate in the DOM: ledger order sorts our registration
-  // (priority -1) before the native one, so the FIRST models-labeled nav
-  // button is ours - keep it, hide the rest. Either row would render our
-  // content anyway (the winner projection picks the lowest priority entry for
-  // the id), so this is purely cosmetic and can never break navigation.
-  ctx.effect(() => {
-    const dedupeNav = (): void => {
-      const buttons = document.querySelectorAll('[role="dialog"] nav button')
-      let seen = false
-      for (const button of buttons) {
-        if (!MODELS_NAV_LABELS.has((button.textContent ?? '').trim())) continue
-        const duplicate = seen
-        seen = true
-        const el = button as HTMLElement
-        const display = duplicate ? 'none' : ''
-        if (el.style.display !== display) el.style.display = display
-      }
-    }
-    const observer = new MutationObserver(dedupeNav)
-    observer.observe(document.body, { childList: true, subtree: true })
-    dedupeNav()
-    return () => { observer.disconnect() }
-  }, 'dsh-cline: settings nav dedupe')
-
-  const connection = ctx.get('connection') as ConnectionHandle | undefined
-  if (connection === undefined) {
-    ctx.logger.warn('dsh-cline client: connection service unavailable; surfaces dormant')
-    return
-  }
-  const api = connection.api
-
-  // Shadow the official deepseek-official onboarding step (same slot id,
-  // priority -1: the lower priority registration is the cell winner).
-  ctx.slots.inject('settings.onboarding', () => ctx.slots.register({
-    name: 'settings.onboarding',
-    id: 'deepseek-official',
-    order: 0,
-    priority: -1,
+  // Extend the native Models page; never add a second provider settings page.
+  ctx.slots.inject('settings.models.provider-card', () => ctx.slots.register({
+    name: 'settings.models.provider-card', key: 'llm-pi-ai',
     inject: () => ({ api }),
-  }, SsyOnboarding))
-
-  // Take over the native Models section: DSH Cline makes Shengsuanyun the
-  // default provider, and API keys/models are configured ONLY here. A plain
-  // priority -1 shadow (lowest priority wins the cell) makes OUR registration
-  // the rendered「模型」content. The settings shell's nav reads the RAW ledger
-  // (winner projection is never used), so the native「模型」row is unavoidably
-  // present too — removing it would need the native registration's disposer,
-  // which the slot API does not expose. What we must NOT do is "keep our entry
-  // at the head" by deregistering/re-registering on every ledger change: that
-  // self-touching loop spins unbounded and crashed the renderer (v0.9.2). One
-  // registration, shadowed by priority, is the whole fix.
-  ctx.slots.inject('settings.section', () => ctx.slots.register({
-    name: 'settings.section',
-    id: 'models',
-    order: 10,
-    priority: -1,
-    label: () => '模型',
+  }, SsyProviderCard))
+  ctx.slots.inject('settings.models.footer', () => ctx.slots.register({
+    name: 'settings.models.footer', id: 'dsh-cline-shengsuanyun', order: 25,
     inject: () => ({ api }),
-  }, DshClineModelsSection))
-
-  // The DSH Cline settings section in the settings panel nav.
+  }, SsyModelsFooter))
   ctx.slots.inject('settings.section', () => ctx.slots.register({
     name: 'settings.section',
     id: 'dsh-cline',

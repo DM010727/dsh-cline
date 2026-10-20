@@ -1,4 +1,5 @@
 import * as vscode from 'vscode'
+import { randomUUID } from 'node:crypto'
 import type { BridgeServer } from './bridge'
 import { openEditPreview } from './edit-preview'
 
@@ -20,6 +21,13 @@ interface PathPayload {
 /** The vscode:// callback authority (publisher.name) for the Shengsuanyun OAuth flow. */
 export const SSY_CALLBACK_AUTHORITY = 'shengsuan-cloud.cline-shengsuan'
 
+/** Shengsuanyun channel-attribution ref, carried on auth links and API calls. */
+export const SSY_CHANNEL_REF = 'CH_L5K542DT'
+
+/** Header marking every request DSH Cline sends to Shengsuanyun (usage attribution). */
+export const SSY_TITLE_HEADER = 'X-title'
+export const SSY_TITLE_VALUE = 'DSH-Cline'
+
 /** Resolve a model-supplied path against the workspace; absolute paths pass through. */
 function resolvePath(path: string): vscode.Uri {
   if (/^([a-zA-Z]:[\\/]|\\\\|\/)/.test(path)) return vscode.Uri.file(path)
@@ -32,6 +40,7 @@ function resolvePath(path: string): vscode.Uri {
 export interface HostActions {
   /** Restart the terminal-resident DSH service (sidecar manager). */
   restartDsh?(): void
+  createSsyCallback?(): string
 }
 
 /**
@@ -43,6 +52,7 @@ export interface HostActions {
  *   bridge starts, so callers pass a getter-style indirection when needed).
  */
 export function registerHandlers(bridge: BridgeServer, extensionVersion: string, actions?: HostActions): void {
+  let selectionSnapshot: { token: string; uri: string; version: number; range: vscode.Selection } | undefined
   bridge.handle('vscode.host.ping', async () => ({ pong: true, extensionVersion }))
 
   // Cline-style pre-write edit preview. DSH intercepts the edit tool call in
@@ -51,6 +61,7 @@ export function registerHandlers(bridge: BridgeServer, extensionVersion: string,
   // from the tool input, and opens a diff whose right side sweeps the change in — so
   // the user sees it "written" as DSH is about to apply it, not after the fact.
   bridge.handle('vscode.diff.begin', async args => {
+    if (vscode.workspace.getConfiguration('dsh-cline').get<boolean>('diffOnEdit') === false) return { shown: false, reason: 'disabled' }
     const [payload] = args as [{ tool?: unknown; args?: unknown; original?: unknown }]
     const tool = payload === null || typeof payload !== 'object' ? undefined : payload.tool
     const toolArgs = payload === null || typeof payload !== 'object' ? undefined : payload.args
@@ -92,8 +103,11 @@ export function registerHandlers(bridge: BridgeServer, extensionVersion: string,
   // extension.ts exchanges the returned code for an API key. The callback URL
   // must be built HERE - only the extension knows its own publisher/name id.
   bridge.handle('vscode.ssy.login', async () => {
-    const callbackUrl = `${vscode.env.uriScheme}://${SSY_CALLBACK_AUTHORITY}/ssy`
+    const callbackUrl = actions?.createSsyCallback?.()
+    if (callbackUrl === undefined) throw new Error('login callback not configured')
     const authUrl = new URL('https://router.shengsuanyun.com/auth')
+    // `from` carries the channel attribution for Shengsuanyun's analytics.
+    authUrl.searchParams.set('from', SSY_CHANNEL_REF)
     authUrl.searchParams.set('callback_url', callbackUrl)
     const opened = await vscode.env.openExternal(vscode.Uri.parse(authUrl.toString()))
     return { opened, callbackUrl }
@@ -166,6 +180,7 @@ export function registerHandlers(bridge: BridgeServer, extensionVersion: string,
     const editor = vscode.window.activeTextEditor
     if (editor === undefined) return { active: false }
     const selection = editor.selection
+    selectionSnapshot = { token: randomUUID(), uri: editor.document.uri.toString(), version: editor.document.version, range: selection }
     return {
       active: true,
       file: editor.document.uri.fsPath,
@@ -173,6 +188,7 @@ export function registerHandlers(bridge: BridgeServer, extensionVersion: string,
       line: selection.active.line + 1,
       column: selection.active.character + 1,
       selectionText: editor.document.getText(selection).slice(0, 2000),
+      selectionToken: selectionSnapshot.token,
     }
   })
 
@@ -180,12 +196,19 @@ export function registerHandlers(bridge: BridgeServer, extensionVersion: string,
   // write generated text (explanation / completion) back into it. The replace lands
   // in the active editor's current selection if present.
   bridge.handle('vscode.editor.applySelection', async args => {
-    const [payload] = args as [{ text?: unknown }]
+    const [payload] = args as [{ text?: unknown; selectionToken?: unknown }]
     const text = payload === null || typeof payload !== 'object' ? undefined : payload.text
     if (typeof text !== 'string') throw new Error('text is required')
     const editor = vscode.window.activeTextEditor
     if (editor === undefined) return { applied: false, reason: 'no active editor' }
-    await editor.edit(edit => edit.replace(editor.selection, text))
+    const snapshot = selectionSnapshot
+    if (!snapshot || payload.selectionToken !== snapshot.token || editor.document.uri.toString() !== snapshot.uri
+      || editor.document.version !== snapshot.version || !editor.selection.isEqual(snapshot.range)) {
+      throw new Error('editor/selection changed; read active_editor again before applying')
+    }
+    selectionSnapshot = undefined
+    const applied = await editor.edit(edit => edit.replace(snapshot.range, text))
+    if (!applied) throw new Error('editor rejected selection edit')
     return { applied: true, file: editor.document.uri.fsPath }
   })
 
@@ -199,7 +222,7 @@ export function registerHandlers(bridge: BridgeServer, extensionVersion: string,
 
   bridge.handle('vscode.config.update', async args => {
     const [key, value] = args as [string, unknown]
-    if (typeof key !== 'string' || !/^[\w.-]+$/.test(key)) throw new Error('invalid config key')
+    if (key !== 'diffOnEdit' || typeof value !== 'boolean') throw new Error('only the boolean diffOnEdit setting can be changed through the web bridge')
     // The inspection default is treated as "unset" so the UI round-trips the
     // shipped default instead of baking it in as a user override.
     const inspect = vscode.workspace.getConfiguration('dsh-cline').inspect(key)
@@ -247,6 +270,7 @@ function computeNewContent(
     const eol = detectLineEnding(original)
     const oldN = normalizeLineEndings(oldText, eol)
     const newN = normalizeLineEndings(newText, eol)
+    if (oldN === '') return { ok: false, error: 'edit: old_string cannot be empty' }
     const occurrences = original.split(oldN).length - 1
     const replaceAll = args.replace_all === true
     if (occurrences === 0) return { ok: false, error: 'edit: text not found' }
@@ -266,6 +290,7 @@ function computeNewContent(
       if (typeof oldStr !== 'string' || typeof newStr !== 'string') {
         return { ok: false, error: 'str_replace requires old_str and new_str' }
       }
+      if (oldStr === '') return { ok: false, error: 'str_replace: old_str cannot be empty' }
       const occurrences = original.split(oldStr).length - 1
       if (occurrences === 0 || occurrences > 1) return { ok: false, error: 'str_replace: not found or ambiguous' }
       return { ok: true, content: original.replace(oldStr, () => newStr) }
@@ -273,14 +298,14 @@ function computeNewContent(
     if (command === 'insert') {
       const insertLine = args.insert_line
       const newStr = args.new_str
-      if (typeof insertLine !== 'number' || typeof newStr !== 'string') {
+      if (!Number.isInteger(insertLine) || typeof newStr !== 'string') {
         return { ok: false, error: 'insert requires insert_line and new_str' }
       }
       const eol = detectLineEnding(original)
       const lines = original.split(/\r\n|\n/)
       const boundary = lines.length + 1
-      if (insertLine < 1 || insertLine > boundary) return { ok: false, error: 'insert_line out of range' }
-      lines.splice(insertLine - 1, 0, ...newStr.split(/\r\n|\n/))
+      if ((insertLine as number) < 1 || (insertLine as number) > boundary) return { ok: false, error: 'insert_line out of range' }
+      lines.splice((insertLine as number) - 1, 0, ...newStr.split(/\r\n|\n/))
       return { ok: true, content: lines.join(eol) }
     }
     return { ok: false, error: 'str_replace_editor command not previewable: ' + String(command) }

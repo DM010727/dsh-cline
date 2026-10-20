@@ -15,6 +15,8 @@ export interface SidecarStatus {
   state: SidecarState
   /** Loopback URL of the sidecar once ready, e.g. http://127.0.0.1:52341. */
   url?: string
+  /** Private embedded UI entrance; never use it for logs or API URL concatenation. */
+  browserUrl?: string
   /** Human-readable diagnostic for the starting/failed states. */
   detail?: string
 }
@@ -26,7 +28,7 @@ export const SHELL_CHANNEL = 'dsh-cline.shell'
 export const GUIDE_CHANNEL = 'dsh-cline.guide'
 
 /** Where the resolved `dsh` executable came from; drives the guide page. */
-export type DshVia = 'configured' | 'path' | 'npx-cache' | 'none'
+export type DshVia = 'managed' | 'configured' | 'path' | 'npx-cache' | 'none'
 
 /** Runtime detection snapshot backing the onboarding guide page. */
 export interface RuntimeStatus {
@@ -34,16 +36,20 @@ export interface RuntimeStatus {
   node: boolean
   via: DshVia
   cmd: string
+  installedVersion?: string
+  compatible?: boolean
+  /** An actionable installation/dependency verification failure. */
+  issue?: string
 }
 
 /** Messages the onboarding guide page sends to the extension host. */
 export type GuideToHost =
   | { channel: typeof GUIDE_CHANNEL; type: 'install' }
+  | { channel: typeof GUIDE_CHANNEL; type: 'install-mirror' }
   | { channel: typeof GUIDE_CHANNEL; type: 'install-node' }
   | { channel: typeof GUIDE_CHANNEL; type: 'open-node-page' }
   | { channel: typeof GUIDE_CHANNEL; type: 'show-terminal' }
   | { channel: typeof GUIDE_CHANNEL; type: 'recheck' }
-  | { channel: typeof GUIDE_CHANNEL; type: 'continue-anyway' }
 
 /** Messages the webview shell sends to the extension host. */
 export type ShellToHost =

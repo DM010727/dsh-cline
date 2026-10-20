@@ -1,0 +1,21 @@
+{
+  "name": "dsh-cline-managed-runtime",
+  "version": "0.2.1-rc.2-r1",
+  "private": true,
+  "description": "Pinned DSH runtime with the fflate security update applied at installation",
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.2.1-rc.2"
+  },
+  "overrides": {
+    "@deepseek-ai/libreoffice-kit": {
+      "fflate": "0.8.3"
+    }
+  },
+  "allowScripts": {
+    "@deepseek-ai/dsh-subprocess-local@0.2.1-rc.2": true,
+    "@google/genai@2.21.0": true,
+    "koffi@3.1.1": true,
+    "node-pty@1.2.0-beta.15": true,
+    "protobufjs@7.6.6": true
+  }
+}

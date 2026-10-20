@@ -2,7 +2,7 @@
   "name": "cline-shengsuan",
   "displayName": "DSH Cline",
   "description": "Open-source DeepSeek Harness + Cline VS Code extension (agent, live diff, MCP)",
-  "version": "4.2.5",
+  "version": "4.5.1",
   "license": "MIT",
   "publisher": "shengsuan-cloud",
   "private": false,
@@ -45,6 +45,9 @@
     "README.md",
     "LICENSE"
   ],
+  "vsce": {
+    "baseImagesUrl": "https://raw.githubusercontent.com/DM010727/dsh-cline/main/packages/extension"
+  },
   "contributes": {
     "viewsContainers": {
       "activitybar": [
@@ -104,6 +107,11 @@
         "command": "dsh-cline.cleanupDshProcesses",
         "title": "清理残留 DSH 进程...",
         "category": "DSH Cline"
+      },
+      {
+        "command": "dsh-cline.updateRuntime",
+        "title": "安装／升级 DSH 运行时到 0.2.1-rc.2",
+        "category": "DSH Cline"
       }
     ],
     "menus": {
@@ -131,22 +139,29 @@
         "dsh-cline.dshCommand": {
           "type": "string",
           "default": "dsh",
-          "markdownDescription": "`dsh` 可执行文件名或绝对路径（需为 0.1.0-rc.5 及以上，内置 web profile）。"
+          "markdownDescription": "从 4.3.1 起扩展使用独立、锁定且校验安全补丁的 DSH 运行时。使用「DSH Cline: 安装／升级 DSH 运行时」安装或修复；此旧设置不再用于启动服务。",
+          "deprecationMessage": "已改用扩展专用运行时，此设置不再使用。"
         },
         "dsh-cline.host": {
           "type": "string",
           "default": "127.0.0.1",
-          "markdownDescription": "DSH 服务绑定地址（DSH 仅支持 127.0.0.1）。"
+          "markdownDescription": "DSH 服务绑定地址（DSH 仅支持 127.0.0.1）。",
+          "enum": [
+            "127.0.0.1",
+            "localhost"
+          ]
         },
         "dsh-cline.diffOnEdit": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "edit/write 工具执行后，自动在 VS Code 原生 diff 编辑器中呈现变更（Cline 式体验）。"
+          "markdownDescription": "在已批准的 edit/write 工具写入前捕获原稿，并在 VS Code 原生 diff 编辑器中显示变更预览。"
         },
         "dsh-cline.port": {
-          "type": "number",
+          "type": "integer",
           "default": 52341,
-          "markdownDescription": "DSH 服务端口（固定端口，终端常驻方案无法使用随机端口）。本地已有 `dsh web` 跑在同一端口时插件会直接绑定它。"
+          "markdownDescription": "手动指定本工作区的服务端口。不显式配置时按工作区路径分配稳定端口，避免多窗口串线；只绑定插件标识和工作区均匹配的实例。",
+          "minimum": 1024,
+          "maximum": 65535
         }
       }
     }
@@ -168,5 +183,11 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/DM010727/dsh-cline.git"
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "DSH can execute tools and commands; open a trusted workspace to enable it."
+    }
   }
 }

@@ -33,7 +33,14 @@ export class BridgeServer {
 
   constructor() {
     this.token = crypto.randomBytes(24).toString('base64url')
-    this.server = http.createServer((req, res) => { void this.dispatch(req, res) })
+    this.server = http.createServer((req, res) => {
+      void this.dispatch(req, res).catch(() => {
+        if (!res.headersSent) res.writeHead(400)
+        res.end()
+      })
+    })
+    this.server.requestTimeout = 15_000
+    this.server.headersTimeout = 10_000
   }
 
   /** Register one handler under '<service>.<method>'; last write wins. */
@@ -75,13 +82,19 @@ export class BridgeServer {
       res.writeHead(404).end()
       return
     }
-    let body = ''
+    // The bridge is server-to-server. Browser origins are never needed here.
+    if (req.headers.origin !== undefined || req.headers['sec-fetch-site'] !== undefined
+      || !/^application\/json(?:\s*;|$)/i.test(req.headers['content-type'] ?? '')) {
+      res.writeHead(403).end()
+      return
+    }
+    const chunks: Buffer[] = []
     let bytes = 0
     let overflow = false
     for await (const chunk of req) {
       bytes += (chunk as Buffer).length
       if (bytes > MAX_BODY_BYTES) { overflow = true; break }
-      body += (chunk as Buffer).toString('utf8')
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
     }
     if (overflow) {
       res.writeHead(413).end()
@@ -89,13 +102,13 @@ export class BridgeServer {
     }
     let request: BridgeRequest
     try {
-      request = JSON.parse(body) as BridgeRequest
+      request = JSON.parse(Buffer.concat(chunks).toString('utf8')) as BridgeRequest
     } catch {
       res.writeHead(400, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ ok: false, error: 'invalid JSON' } satisfies BridgeResult))
       return
     }
-    if (typeof request.service !== 'string' || typeof request.method !== 'string' || !Array.isArray(request.args)) {
+    if (request === null || typeof request !== 'object' || typeof request.service !== 'string' || typeof request.method !== 'string' || !Array.isArray(request.args)) {
       res.writeHead(400, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ ok: false, error: 'invalid envelope' } satisfies BridgeResult))
       return

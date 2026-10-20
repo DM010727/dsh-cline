@@ -12,16 +12,19 @@
  */
 
 import { readFileSync } from 'node:fs'
-import { join } from 'node:path'
-import type { Context, WebServerService } from '@deepseek-ai/cordis'
+import { randomUUID } from 'node:crypto'
+import { isAbsolute, join, relative, resolve } from 'node:path'
+import type { Context, Volatile, WebServerService } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { installSettingsSection } from '@deepseek-ai/dsh-settings'
 import { registerDiffMirror } from './diff-mirror.js'
 import { registerVscodeTool } from './vscode-tool.js'
 import { loadMcpServers } from './mcp-loader.js'
 import { registerCheckpoint } from './checkpoint.js'
 import { registerWebGateway } from './web-gateway.js'
 import { registerTaskInjector } from './task-injector.js'
+import { createHealthHandler, isBridgeUrl } from './web-bootstrap.js'
+import { canonicalPath, isWithinWorkspace } from './workspace-context.js'
+import { registerWorkspaceBridge } from './workspace-bridge.js'
 
 /** Stable Cordis plugin name. */
 export const name = 'dsh-cline-host-services'
@@ -61,28 +64,18 @@ export interface VscodeHostService {
 export interface PluginConfig {
   bridgeUrl?: string | null
   /** Which tools trigger pre-execution auto-snapshots. */
-  checkpointAuto?: 'off' | 'edit-only' | 'all'
+  checkpointAuto: Volatile<'off' | 'edit-only' | 'all'>
 }
 
-/** The settings-editable slice of the config (the composition entry's bridgeUrl is not user-editable). */
-interface SettingsConfig {
-  checkpointAuto?: 'off' | 'edit-only' | 'all'
-}
-
-/** Config schema of {@link SETTINGS_NS} (web section writes land here). Schemastery,
- * like every DSH settings consumer: the service VALIDATES by calling `schema(value)`,
- * and a zod schema is not callable - registering with one fails the namespace. */
-const ConfigSchema = z.object({
-  checkpointAuto: z.union([z.const('off'), z.const('edit-only'), z.const('all')]),
+/** rc.2 settings expose the live checkpoint policy from this Loader entry. */
+export const Config = z.object({
+  bridgeUrl: z.union([z.string(), z.const(null)]).default(null),
+  checkpointAuto: z.union([z.const('off'), z.const('edit-only'), z.const('all')]).default('edit-only').volatile(),
 })
-
-/** Settings base layer: the composition entry's checkpoint policy with its default resolved. */
-function entryOf(config: PluginConfig): SettingsConfig {
-  return { checkpointAuto: config.checkpointAuto ?? 'edit-only' }
-}
 
 /** Default request budget for one bridge RPC. */
 const BRIDGE_TIMEOUT_MS = 20_000
+const instanceId = randomUUID()
 
 /**
  * Bridge locator file the extension rewrites at EVERY activation
@@ -101,9 +94,14 @@ function bridgeFileUrl(): string | undefined {
   const home = process.env.DSH_HOME
   if (home === undefined || home === '') return undefined
   try {
-    const parsed = JSON.parse(readFileSync(join(home, 'bridge.json'), 'utf8')) as { url?: unknown }
+    const configured = process.env.DSH_CLINE_BRIDGE_FILE
+    const file = configured === undefined || configured === '' ? join(home, 'bridge.json') : resolve(configured)
+    const rel = relative(resolve(home), file)
+    if (isAbsolute(rel) || rel === '..' || rel.startsWith('../') || rel.startsWith('..\\')) return undefined
+    if (!isWithinWorkspace(canonicalPath(file), canonicalPath(home))) return undefined
+    const parsed = JSON.parse(readFileSync(file, 'utf8')) as { url?: unknown }
     const url = parsed.url
-    if (typeof url === 'string' && /^http:\/\/127\.0\.0\.1:\d+\/.+$/.test(url)) return url
+    if (isBridgeUrl(url)) return url
   } catch { /* no locator yet, or mid-write: fall back to the composition entry */ }
   return undefined
 }
@@ -119,18 +117,14 @@ const HEALTH_PATH = '/dsh-cline/health'
  *   VS Code host launched this process, so only the MCP half activates.
  */
 export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
-  // Register the settings namespace the web「DSH Cline」section edits: without
-  // it every settings.mutate against 'dsh-cline-host-services' rejects with
-  // "settings namespace is not registered". While a settings service exists
-  // the resolved scope is authoritative; otherwise the composition entry is.
-  let current: () => SettingsConfig = () => entryOf(config)
-  installSettingsSection(ctx, SETTINGS_NS, ConfigSchema, entryOf(config), {
-    setSource: (source) => { current = source },
-    onChange: () => { /* checkpointAuto is read per tool dispatch */ },
+  // rc.2 settings project the volatile field from this plugin's Loader entry.
+  // The client provides a custom page, so suppress only the generated form.
+  ctx.inject(['settings'], child => {
+    child.effect(() => child.settings.configure({ auto: false }, ctx.fiber))
   })
 
   const mcpServers = await loadMcpServers(ctx)
-  registerCheckpoint(ctx, () => current().checkpointAuto ?? 'edit-only')
+  registerCheckpoint(ctx, () => config.checkpointAuto.get())
   // Prefer the locator file over the composition env: it tracks the live
   // extension host across window reloads, the env value does not.
   const bridgeUrl = bridgeFileUrl() ?? config.bridgeUrl
@@ -149,13 +143,17 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
     // The gateway still mounts: the catalog proxy is bridge-independent, and
     // the bridge-dependent routes answer a clean 503 instead of 404.
     registerWebGateway(ctx, webServer, undefined)
+    registerHealth(ctx, webServer, undefined, mcpServers, () => bridgeFileUrl() ?? config.bridgeUrl)
     return
-  }  if (!/^http:\/\/127\.0\.0\.1:\d+\/.+$/.test(bridgeUrl)) {
+  }
+  if (!isBridgeUrl(bridgeUrl)) {
     throw new Error(
       'dsh-cline-host-services: bridgeUrl must be a loopback URL with a token path '
-      + '(http://127.0.0.1:<port>/<token>), got ' + JSON.stringify(bridgeUrl),
+      + '(http://127.0.0.1:<port>/<token>)',
     )
   }
+
+  registerWorkspaceBridge(ctx, webServer)
 
   // Resolve per call: a window reload replaces the extension host (new bridge
   // port) and rewrites the locator file; re-reading it here keeps this
@@ -164,7 +162,9 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
   const service: VscodeHostService = {
     async ping() {
       const raw = await bridge({ service: 'vscode.host', method: 'ping', args: [] })
-      return raw as { pong: true; extensionVersion: string }
+      if (raw === null || typeof raw !== 'object' || (raw as { pong?: unknown }).pong !== true
+        || typeof (raw as { extensionVersion?: unknown }).extensionVersion !== 'string') throw new Error('invalid VS Code bridge pong')
+      return { pong: true, extensionVersion: (raw as { extensionVersion: string }).extensionVersion }
     },
     call(service, method, args) {
       return bridge({ service, method, args }).then(v => v as unknown)
@@ -174,24 +174,21 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
   registerDiffMirror(ctx, service)
   registerVscodeTool(ctx, service)
   registerWebGateway(ctx, webServer, service)
+  registerHealth(ctx, webServer, service, mcpServers, () => bridgeFileUrl() ?? config.bridgeUrl)
   ctx.logger.info('vscodeHost provided via bridge ' + bridgeUrl.replace(/\/[^/]+$/, '/***'))
+}
+
+function registerHealth(ctx: Context, webServer: WebServerService, service: VscodeHostService | undefined, mcpServers: number, bridgeUrl: () => unknown): void {
   ctx.effect(() => webServer.register({
     kind: 'exact',
     path: HEALTH_PATH,
-    handler: async (req, res) => {
-      if (req.method !== 'GET') {
-        res.writeHead(405).end()
-        return
-      }
-      try {
-        const pong = await service.ping()
-        res.writeHead(200, { 'content-type': 'application/json' })
-        res.end(JSON.stringify({ bridge: 'up', mcpServers, ...pong }))
-      } catch (err: unknown) {
-        res.writeHead(502, { 'content-type': 'application/json' })
-        res.end(JSON.stringify({ bridge: 'down', mcpServers, error: String(err) }))
-      }
-    },
+    handler: createHealthHandler({
+      identity: () => ({ plugin: name, workspaceRoot: process.cwd(), instanceId, mcpServers,
+        runtimeRevision: process.env.DSH_CLINE_RUNTIME_REVISION ?? null }),
+      service,
+      bridgeUrl,
+      connection: () => ctx.get('connection'),
+    }),
   }), 'dsh-cline-host-services: health route')
 }
 
@@ -204,6 +201,7 @@ function createBridgeClient(resolveUrl: () => string): (request: BridgeRequest) 
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(request),
+        redirect: 'error',
         signal: AbortSignal.timeout(BRIDGE_TIMEOUT_MS),
       })
     } catch (err: unknown) {

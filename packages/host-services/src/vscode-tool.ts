@@ -25,6 +25,7 @@ interface VscodeToolArgs {
   language?: unknown
   title?: unknown
   text?: unknown
+  selectionToken?: unknown
 }
 
 /** The canonical JSON value this tool returns. */
@@ -57,7 +58,7 @@ export function registerVscodeTool(ctx: Context, vscodeHost: VscodeHostService):
   ctx.systemPrompt.section({
     name: 'tool:vscode',
     order: 112,
-    text: 'You are embedded in VS Code via the DSH Cline extension. The vscode tool actuates the user\'s editor window: open_file (with optional 1-based line), open_diff (leftText/rightText/language/title), open_external (http(s) URL in the system browser), reveal_in_explorer (path), active_editor (read the user\'s current file and selection), apply_selection (replace the current selection with generated text, e.g. an explanation or completion). Use it to show the user files, changes, and links directly in their editor instead of describing them.',
+    text: 'You are embedded in VS Code via the DSH Cline extension. The vscode tool actuates the user\'s editor window: open_file (with optional 1-based line), open_diff (leftText/rightText/language/title), open_external (http(s) URL in the system browser), reveal_in_explorer (path), active_editor (read the user\'s current file and selection), apply_selection (replace the captured selection with generated text). Before apply_selection, call active_editor and pass its selectionToken; if the token expires, read active_editor again. Use it to show the user files, changes, and links directly in their editor instead of describing them.',
   })
 
   ctx.tools.register({
@@ -76,6 +77,7 @@ export function registerVscodeTool(ctx: Context, vscodeHost: VscodeHostService):
         language: { type: 'string', description: 'open_diff: language id for both sides (default plaintext).' },
         title: { type: 'string', description: 'open_diff: diff tab title.' },
         text: { type: 'string', description: 'apply_selection: the text to replace the current editor selection with.' },
+        selectionToken: { type: 'string', description: 'apply_selection: the selectionToken returned by the preceding active_editor call; expires when the editor, document version, or selection changes.' },
       },
       required: ['action'],
     },
@@ -92,7 +94,8 @@ export function registerVscodeTool(ctx: Context, vscodeHost: VscodeHostService):
       },
       render: (_args: unknown, value: unknown) => [{ type: 'text', text: JSON.stringify(value) }],
     },
-    isConcurrencySafe: () => true,
+    // Editor-changing actions must not race a sibling applying a selection.
+    isConcurrencySafe: args => (args as VscodeToolArgs | null)?.action === 'active_editor',
     async execute(args: unknown): Promise<VscodeToolValue> {
       const a = (args ?? {}) as VscodeToolArgs
       if (typeof a.action !== 'string' || !(ACTIONS as readonly string[]).includes(a.action)) {
@@ -111,6 +114,7 @@ export function registerVscodeTool(ctx: Context, vscodeHost: VscodeHostService):
 function buildPayload(action: Action, a: VscodeToolArgs): unknown[] {
   if (action === 'open_file' || action === 'reveal_in_explorer') {
     if (typeof a.path !== 'string' || a.path === '') throw new Error('vscode ' + action + ': path is required')
+    if (a.line !== undefined && (!Number.isInteger(a.line) || Number(a.line) < 1)) throw new Error('vscode open_file: line must be a positive integer')
     return [{ path: a.path, ...(action === 'open_file' && typeof a.line === 'number' ? { line: a.line } : {}) }]
   }
   if (action === 'open_external') {
@@ -133,7 +137,8 @@ function buildPayload(action: Action, a: VscodeToolArgs): unknown[] {
   }
   if (action === 'apply_selection') {
     if (typeof a.text !== 'string') throw new Error('vscode apply_selection: text is required')
-    return [{ text: a.text }]
+    if (typeof a.selectionToken !== 'string' || a.selectionToken === '') throw new Error('vscode apply_selection: read active_editor and provide its selectionToken')
+    return [{ text: a.text, selectionToken: a.selectionToken }]
   }
   return []
 }

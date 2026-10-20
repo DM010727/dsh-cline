@@ -1,5 +1,8 @@
 import * as http from 'node:http'
+import { connect } from 'node:net'
 import { EventEmitter } from 'node:events'
+import { resolve } from 'node:path'
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import type { SidecarState, SidecarStatus } from '@dsh-cline/protocol'
 
 /** Cold boot (first run initializes the profile) can be slow on fresh machines. */
@@ -19,6 +22,10 @@ export interface SidecarCommand {
   /** Loopback host/port the service is expected on; drives the probe URL. */
   host: string
   port: number
+  workspaceRoot?: string
+  runtimeRevision?: string
+  /** Extension bridge capability; only origin-bound HMAC proofs leave this process. */
+  bootstrapKey?: string
 }
 
 /**
@@ -33,7 +40,7 @@ export interface SidecarHost {
    * awaiting it keeps the probe loop from polling a command that never ran
    * (the sendText/creation race on Windows PowerShell drops the Enter).
    */
-  launch(cmd: SidecarCommand): void | Promise<void>
+  launch(cmd: SidecarCommand, signal?: AbortSignal): void | Promise<void>
   /**
    * Best-effort discovery of locally running `dsh web` listeners (candidate
    * URLs read from process command lines). Probed as a FALLBACK when the
@@ -44,13 +51,14 @@ export interface SidecarHost {
   /** Whether the service terminal still exists (not closed by the user). */
   alive(): boolean
   /** Best-effort interrupt of the running process (Ctrl+C in the terminal). */
-  interrupt?(): void
+  interrupt?(): boolean | void
 }
 
 /** State transition broadcast; `url` is set on ready. */
 export interface SidecarChangeEvent {
   state: SidecarState
   url?: string
+  browserUrl?: string
   detail?: string
 }
 
@@ -70,11 +78,14 @@ function delay(ms: number): Promise<void> {
 export class SidecarManager extends EventEmitter {
   private state: SidecarState = 'stopped'
   private urlValue?: string
+  private browserUrlValue?: string
+  private legacyBootstrap = false
   private detailValue?: string
   private starting?: Promise<string>
   private watchdog?: NodeJS.Timeout
   private gen = 0
   private disposed = false
+  private launchAbort?: AbortController
   /**
    * How the current ready URL was reached: 'bind' = an already-running dsh web
    * answered the probe (its in-memory plugin predates any on-disk plugin
@@ -96,13 +107,14 @@ export class SidecarManager extends EventEmitter {
     private readonly resolveCommand: () => SidecarCommand,
     private readonly preLaunch?: (detail: (msg: string) => void) => Promise<void>,
     private readonly host?: SidecarHost,
+    private readonly connectBrowser?: (origin: string, authenticatedUrl: string) => Promise<string>,
   ) {
     super()
   }
 
   /** Current snapshot for status bars and webview shells. */
   status(): SidecarStatus {
-    return { state: this.state, url: this.urlValue, detail: this.detailValue }
+    return { state: this.state, url: this.urlValue, browserUrl: this.browserUrlValue, detail: this.detailValue }
   }
 
   /**
@@ -128,14 +140,37 @@ export class SidecarManager extends EventEmitter {
         this.setState('starting', undefined, '正在准备 dsh 运行时…')
         await this.preLaunch(msg => this.setState('starting', undefined, msg))
       }
+      if (gen !== this.gen || this.disposed) throw new Error('superseded')
       const url = this.baseUrl()
       this.setState('starting', undefined, '正在检测本地 DSH…')
-      // Bind to an instance that is already running locally - never relaunch it.
-      if (await this.probe(url)) return this.settleReady(gen, url, 'bind')
-      // Not running: launch it in the terminal (the host waits for the shell
-      // to accept input before typing), then wait for a listener to answer.
-      this.setState('starting', undefined, 'DSH 启动中：正在 VS Code 终端中启动 dsh web…')
-      await this.host?.launch(this.resolveCommand())
+      // Bind only after identity, bridge and authenticated UI readiness agree.
+      if (await this.probeReady(url)) return this.settleReady(gen, url, 'bind')
+      if (gen !== this.gen || this.disposed) throw new Error('superseded')
+      let listening = await this.carrierUp(url)
+      // The old plugin is identified by workspace, revision and live bridge,
+      // but cannot supply the new authenticated UI entrance. Upgrade only a
+      // process whose own terminal we can control, never an unknown listener.
+      if (listening && this.legacyBootstrap && this.host?.interrupt !== undefined) {
+        if (gen !== this.gen || this.disposed) throw new Error('superseded')
+        this.setState('starting', undefined, '正在重启本工作区旧服务以加载新版认证适配…')
+        if (this.host.interrupt() === false) throw new Error('旧版 DSH 服务需要加载新版插件，请重启本工作区的「DSH Cline 服务」终端后重试。')
+        for (let i = 0; i < 8 && listening; i++) {
+          await delay(POLL_MS)
+          if (gen !== this.gen || this.disposed) throw new Error('superseded')
+          listening = await this.carrierUp(url)
+        }
+        if (listening) throw new Error('旧版 DSH 服务中断后仍在监听，请检查本工作区的「DSH Cline 服务」终端后重试。')
+      }
+      const via = listening ? 'bind' : 'launch'
+      if (!listening) {
+        this.setState('starting', undefined, 'DSH 启动中：正在 VS Code 终端中启动 dsh web…')
+        const launchAbort = new AbortController()
+        this.launchAbort = launchAbort
+        await this.host?.launch(this.resolveCommand(), launchAbort.signal)
+        if (gen !== this.gen || launchAbort.signal.aborted) throw new Error('superseded')
+      } else {
+        this.setState('starting', undefined, '本地服务已监听，正在等待 DSH 认证与工作区桥就绪…')
+      }
       const deadline = Date.now() + START_TIMEOUT_MS
       // The configured port is probed every tick; the process-discovery
       // fallback refreshes its candidates periodically and is probed when the
@@ -144,28 +179,13 @@ export class SidecarManager extends EventEmitter {
       // every few seconds, which reads as the panel endlessly refreshing).
       let discovered: string[] = []
       let discoveredAt = 0
-      // Squatter detection: a listener that never serves the GUI within this
-      // window after OUR launch is a leftover process holding the port (the
-      // fresh `dsh web` died on EADDRINUSE in the terminal). Fail fast with
-      // the recovery command instead of riding out the whole start timeout.
-      const SQUATTER_MS = 30_000
-      let squatterSince: number | undefined
       while (Date.now() < deadline) {
         await delay(POLL_MS)
         if (gen !== this.gen) throw new Error('superseded')
-        if (await this.probe(url)) return this.settleReady(gen, url, 'launch')
+        if (await this.probeReady(url)) return this.settleReady(gen, url, via)
         // Fail fast when the service terminal was closed mid-startup.
-        if (this.host !== undefined && !this.host.alive()) {
+        if (via === 'launch' && this.host !== undefined && !this.host.alive() && !(await this.carrierUp(url))) {
           throw new Error('DSH 启动失败：「DSH Cline 服务」终端已被关闭。请重试，并保持该终端开启。')
-        }
-        if (await this.carrierUp(url)) {
-          if (squatterSince === undefined) squatterSince = Date.now()
-          if (Date.now() - squatterSince >= SQUATTER_MS) {
-            throw new Error('端口 ' + url + ' 被一个无响应的残留进程占用（新启动的 dsh web 已因端口冲突退出，'
-              + '详见「DSH Cline 服务」终端）。请执行命令面板中的「DSH Cline: 清理残留 DSH 进程」后重试。')
-          }
-        } else {
-          squatterSince = undefined
         }
         if (this.host?.discoverUrls !== undefined && Date.now() - discoveredAt >= DISCOVER_EVERY_MS) {
           discoveredAt = Date.now()
@@ -176,18 +196,16 @@ export class SidecarManager extends EventEmitter {
           // Only bind DISCOVERED instances that are OURS: the candidate must
           // serve /dsh-cline/health (mounted by the host-services plugin). A
           // foreign `dsh web` (user's own ~/.dsh home, no plugin, no bridge)
-          // answers 404 there - binding it left the panel on a DSH whose
-          // DSH-Cline features were all dead. The CONFIGURED port keeps its
-          // plain bind: an instance there was started on our port on purpose.
-          if (await this.probe(candidate) && await this.probeOurs(candidate)) {
+          // answers 404 there. Configured and discovered listeners must both
+          // pass the same identity and authenticated bootstrap checks.
+          if (await this.probeReady(candidate)) {
             return this.settleReady(gen, candidate, 'bind')
           }
         }
       }
-      throw new Error('DSH ' + (START_TIMEOUT_MS / 1000) + 's 内未就绪（探测 ' + url
-        + (discovered.length === 0 ? '' : ' 及已发现实例 ' + discovered.join('、') + ' 均无应答')
-        + '）。请查看「DSH Cline 服务」终端中的输出后重试；若端口被旧实例占用（配置页报'
-        + ' "not registered" 类错误），执行「DSH Cline: 重启 DSH 服务」替换它。')
+      throw new Error('DSH ' + (START_TIMEOUT_MS / 1000) + 's 内未通过就绪校验（' + url
+        + '）。监听存在不代表认证、界面和工作区桥已就绪。请查看「DSH Cline 服务」终端中的输出，'
+        + '或执行「DSH Cline: 重启 DSH 服务」后重试。')
     } catch (err: unknown) {
       if (gen !== this.gen) throw err
       this.starting = undefined
@@ -210,9 +228,12 @@ export class SidecarManager extends EventEmitter {
   /** Stop tracking the service (and the watchdog); a new start launches fresh. */
   stop(): void {
     this.gen++
+    this.launchAbort?.abort()
+    this.launchAbort = undefined
     this.starting = undefined
     this.stopWatchdog()
     this.urlValue = undefined
+    this.browserUrlValue = undefined
     this.setState('stopped')
   }
 
@@ -229,13 +250,17 @@ export class SidecarManager extends EventEmitter {
     const previousUrl = this.urlValue
     this.stop()
     const url = previousUrl ?? this.baseUrl()
+    const restartGeneration = this.gen
     if (this.host?.interrupt !== undefined && await this.carrierUp(url)) {
-      this.host.interrupt()
+      if (restartGeneration !== this.gen || this.disposed) throw new Error('superseded')
+      if (this.host.interrupt() === false) throw new Error('无法控制该 DSH 实例的终端，请手动重启对应工作区的 DSH 服务。')
       for (let i = 0; i < 8; i++) {
         await delay(1_000)
         if (!(await this.carrierUp(url))) break
       }
+      if (await this.carrierUp(url)) throw new Error('DSH 在中断后仍占用端口，请检查对应服务终端。')
     }
+    if (restartGeneration !== this.gen || this.disposed) throw new Error('superseded')
     return this.start()
   }
 
@@ -260,18 +285,31 @@ export class SidecarManager extends EventEmitter {
     // never kill a healthy DSH, or the panel would reload between the GUI and
     // the starting page forever.
     let misses = 0
+    let checking = false
     this.watchdog = setInterval(() => {
       if (this.disposed || gen !== this.gen) return this.stopWatchdog()
-      void this.probe(url).then(alive => {
+      if (checking) return
+      checking = true
+      const previousBrowserUrl = this.browserUrlValue
+      void this.probeReady(url).then(async alive => {
         if (this.disposed || gen !== this.gen) return
-        if (alive) { misses = 0; return }
+        if (alive) {
+          misses = 0
+          if (previousBrowserUrl !== this.browserUrlValue) this.setState('ready', url)
+          return
+        }
+        // Authentication/bridge failures do not prove that the process died.
+        // Never send another launch command to a port that is still listening.
+        if (await this.carrierUp(url)) { misses = 0; return }
+        if (this.disposed || gen !== this.gen) return
         if (++misses < 2) return
         misses = 0
         this.stopWatchdog()
         this.urlValue = undefined
+        this.browserUrlValue = undefined
         this.setState('starting', undefined, '检测到 DSH 已停止，正在自动重启…')
         void this.start().catch(() => { /* state broadcast already surfaced */ })
-      })
+      }).finally(() => { checking = false })
     }, WATCHDOG_MS)
     this.watchdog.unref()
   }
@@ -289,18 +327,20 @@ export class SidecarManager extends EventEmitter {
     return 'http://' + host + ':' + port
   }
 
-  /** Any HTTP answer below 500 proves a LISTENER exists (healthy or not). */
+  private async probeReady(url: string): Promise<boolean> {
+    if (!(await this.probeOurs(url))) return false
+    return this.resolveCommand().bootstrapKey !== undefined || await this.probe(url)
+  }
+
+  /** A TCP listener is alive even when HTTP is unauthorized, 5xx, or stalled. */
   private carrierUp(url: string): Promise<boolean> {
     return new Promise<boolean>(resolve => {
-      const req = http.get(url, res => {
-        res.resume()
-        resolve((res.statusCode ?? 500) < 500)
-      })
-      req.on('error', () => resolve(false))
-      req.setTimeout(PROBE_TIMEOUT_MS, () => {
-        req.destroy()
-        resolve(false)
-      })
+      const address = new URL(url)
+      const socket = connect(Number(address.port), address.hostname)
+      const finish = (alive: boolean): void => { socket.destroy(); resolve(alive) }
+      socket.once('connect', () => finish(true))
+      socket.once('error', () => finish(false))
+      socket.setTimeout(PROBE_TIMEOUT_MS, () => finish(false))
     })
   }
 
@@ -331,23 +371,67 @@ export class SidecarManager extends EventEmitter {
 
   /**
    * Whether the instance at `url` carries OUR host-services plugin: it serves
-   * `/dsh-cline/health` (200 with the bridge up, 502 with it down - either
-   * proves the route exists). A foreign `dsh web` 404s there, so discovered
-   * candidates are only bound when this passes.
+   * `/dsh-cline/health` must identify this workspace/runtime with a live bridge.
+   * The managed runtime additionally proves possession of the bridge capability
+   * and supplies its native authenticated browser URL for the private proxy.
    */
-  private probeOurs(url: string): Promise<boolean> {
-    return new Promise<boolean>(resolve => {
-      const req = http.get(url + '/dsh-cline/health', res => {
-        const status = res.statusCode ?? 0
-        res.resume()
-        resolve(status !== 404 && status !== 0)
+  private async probeOurs(url: string): Promise<boolean> {
+    const generation = this.gen
+    const command = this.resolveCommand()
+    const challenge = randomBytes(24).toString('base64url')
+    const origin = new URL(url).origin
+    this.legacyBootstrap = false
+    const body = await new Promise<Record<string, unknown> | undefined>(resolve => {
+      const req = http.get(new URL('/dsh-cline/health', url), {
+        headers: command.bootstrapKey === undefined ? {} : {
+          'x-dsh-cline-challenge': challenge,
+          'x-dsh-cline-proof': bootstrapProof(command.bootstrapKey, 'dsh-cline-bootstrap\n' + origin + '\n' + challenge),
+        },
+      }, res => {
+        if (res.statusCode !== 200 || !/^application\/json/.test(String(res.headers['content-type'] ?? ''))) {
+          res.resume(); resolve(undefined); return
+        }
+        const chunks: Buffer[] = []
+        let bytes = 0
+        res.on('data', (chunk: Buffer) => {
+          bytes += chunk.length
+          if (bytes > 8192) { req.destroy(); resolve(undefined); return }
+          chunks.push(chunk)
+        })
+        res.on('error', () => resolve(undefined))
+        res.on('end', () => {
+          try {
+            const value: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+            resolve(value !== null && typeof value === 'object' ? value as Record<string, unknown> : undefined)
+          } catch { resolve(undefined) }
+        })
       })
-      req.on('error', () => resolve(false))
+      // Bound the entire exchange, including a listener that trickles bytes.
+      const deadline = setTimeout(() => { req.destroy(); resolve(undefined) }, PROBE_TIMEOUT_MS)
+      req.once('close', () => clearTimeout(deadline))
+      req.on('error', () => resolve(undefined))
       req.setTimeout(PROBE_TIMEOUT_MS, () => {
         req.destroy()
-        resolve(false)
+        resolve(undefined)
       })
     })
+    if (generation !== this.gen || this.disposed || body === undefined) return false
+    const expected = command.workspaceRoot
+    if (body.plugin !== 'dsh-cline-host-services' || body.bridge !== 'up'
+      || command.runtimeRevision !== undefined && body.runtimeRevision !== command.runtimeRevision
+      || expected !== undefined && (typeof body.workspaceRoot !== 'string' || !sameWorkspace(body.workspaceRoot, expected))) return false
+    if (command.bootstrapKey === undefined) return true
+    if (typeof body.browserUrl !== 'string') { this.legacyBootstrap = body.bootstrapProtocol === undefined; return false }
+    const proof = bootstrapProof(command.bootstrapKey, 'dsh-cline-bootstrap-response\n' + origin + '\n' + challenge
+      + '\n' + body.browserUrl + '\n' + String(body.workspaceRoot) + '\n' + String(body.runtimeRevision))
+    if (!equalProof(body.bootstrapProof, proof)) return false
+    if (this.connectBrowser === undefined) return false
+    try {
+      const browserUrl = await this.connectBrowser(url, body.browserUrl)
+      if (generation !== this.gen || this.disposed) return false
+      this.browserUrlValue = browserUrl
+      return true
+    } catch { return false }
   }
 
   private setState(state: SidecarState, url?: string, detail?: string): void {
@@ -358,6 +442,20 @@ export class SidecarManager extends EventEmitter {
     if (url !== undefined) this.urlValue = url
     if (state === 'ready') this.detailValue = undefined
     else if (detail !== undefined) this.detailValue = detail
-    this.emit('change', { state, url: url ?? this.urlValue, detail: this.detailValue } satisfies SidecarChangeEvent)
+    this.emit('change', { state, url: url ?? this.urlValue, browserUrl: this.browserUrlValue, detail: this.detailValue } satisfies SidecarChangeEvent)
   }
+}
+
+function sameWorkspace(left: string, right: string): boolean {
+  const normalize = (value: string): string => process.platform === 'win32' ? resolve(value).toLowerCase() : resolve(value)
+  return normalize(left) === normalize(right)
+}
+
+function bootstrapProof(key: string, message: string): string {
+  return createHmac('sha256', key).update(message).digest('base64url')
+}
+
+function equalProof(actual: unknown, expected: string): boolean {
+  if (typeof actual !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(actual)) return false
+  return timingSafeEqual(Buffer.from(actual), Buffer.from(expected))
 }

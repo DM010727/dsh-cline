@@ -1,26 +1,17 @@
 /**
- * Shengsuanyun defaults: v0.9.1 reversed policy - settings.yaml is the DSH
- * settings service's own document and DSH Cline never seeds into it. A seeded
- * second `llm-pi-ai:` key turns the document into a DUPLICATE_KEY parse
- * failure, which takes the settings provider down at boot and leaves every
- * namespace (llm-pi-ai included) unregistered. The routes are written through
- * the settings wire API on demand (onboarding / the「模型」page).
- *
- * This module now only HEALS: it strips the v0.9.0-and-earlier managed block
- * (markers, the renamed `llm-shengsuanyun-ai:` key, or the first of duplicate
- * `llm-pi-ai` keys) when one is still present.
- *
- * Usable as a CLI (prints what it did) or as a module (see exports).
+ * Retired Shengsuanyun seed cleanup. Only exact historical sections are removed;
+ * unknown duplicate settings and user-edited profiles are preserved byte-for-byte.
  */
+import {
+  existsSync, lstatSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync,
+} from 'node:fs'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { homedir } from 'node:os'
+import { randomUUID } from 'node:crypto'
 
-import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
-
-/** Marked block boundaries of the retired seed. */
 const BEGIN = '# === dsh-cline shengsuanyun defaults (managed block, do not edit) ==='
 const END = '# === end dsh-cline shengsuanyun defaults ==='
-
-/** The seed section as it was written (markers excluded), for exact-match removal. */
 const SEED_SECTION = [
   'llm-pi-ai:',
   '  providers:',
@@ -42,79 +33,121 @@ const SEED_SECTION = [
   '      apiKeyEnv: SHENGSUANYUN_API_KEY',
 ].join('\n')
 
-/** The same route table as data, for programmatic consumers. */
 export const SSY_ROUTES_DATA = [
   { route: 'shengsuanyun', displayName: '胜算云', api: 'openai-completions' },
   { route: 'shengsuanyun-responses', displayName: '胜算云 (Responses)', api: 'openai-responses' },
   { route: 'shengsuanyun-messages', displayName: '胜算云 (Messages)', api: 'anthropic-messages' },
 ]
-
 export const SSY_BASE_URL = 'https://router.shengsuanyun.com/api/v1'
 export const SSY_KEY_REF = 'SHENGSUANYUN_API_KEY'
 
-/** One top-level key's subtree: the key line through the line before the next column-0 key. */
-function subtree(lines, at) {
-  let end = lines.length
-  for (let i = at + 1; i < lines.length; i++) {
-    if (/^[^\s#]/.test(lines[i])) { end = i; break }
+/** Resolve the isolated installation home, rejecting the user's original DSH tree. */
+function canonical(path) {
+  let current = resolve(path)
+  const tail = []
+  while (!existsSync(current)) {
+    const parent = dirname(current)
+    if (parent === current) return resolve(path)
+    tail.unshift(basename(current))
+    current = parent
   }
-  return lines.slice(at, end)
+  return join(realpathSync.native(current), ...tail)
+}
+function within(parent, path) {
+  const part = relative(parent, path)
+  return part === '' || (part !== '..' && !part.startsWith('..' + sep) && !isAbsolute(part))
+}
+export function isolatedHome(value = process.env.DSH_CLINE_HOME ?? join(homedir(), '.dsh-cline')) {
+  if (typeof value !== 'string' || value.trim() === '') throw new Error('DSH_CLINE_HOME must not be empty')
+  const selected = resolve(value)
+  if (dirname(selected) === selected || dirname(canonical(selected)) === canonical(selected)) {
+    throw new Error('DSH_CLINE_HOME must not be a filesystem root')
+  }
+  const original = resolve(homedir(), '.dsh')
+  if (within(canonical(original), canonical(selected)) || within(original, selected)) {
+    throw new Error('DSH Cline must not modify the original ~/.dsh')
+  }
+  return selected
 }
 
-/** Remove one top-level key's subtree (returns the input when the key is absent). */
-function removeSubtree(lines, key) {
-  const at = lines.findIndex(line => key.test(line))
-  if (at < 0) return lines
-  return [...lines.slice(0, at), ...lines.slice(at + subtree(lines, at).length)]
+export function assertWithinHome(home, path) {
+  if (!within(canonical(home), canonical(path))) throw new Error('Path escapes DSH_CLINE_HOME: ' + path)
 }
 
-/** Blank-line-insensitive comparison form. */
+/** Reject redirected files: migration/install never follows a profile file symlink. */
+export function assertRegularTarget(path) {
+  if (existsSync(path) && lstatSync(path).isSymbolicLink()) throw new Error('Refusing to modify a symlink: ' + path)
+}
+
+/** Sibling temp+rename avoids publishing truncated YAML on write failure. */
+export function writeAtomic(path, content, expected) {
+  assertRegularTarget(path)
+  const temporary = join(dirname(path), '.' + randomUUID() + '.dsh-cline.tmp')
+  const mode = existsSync(path) ? statSync(path).mode & 0o777 : 0o600
+  try {
+    writeFileSync(temporary, content, { encoding: 'utf8', flag: 'wx', mode })
+    const current = existsSync(path) ? readFileSync(path, 'utf8') : undefined
+    if (current !== expected) throw new Error('File changed during installation; retry: ' + path)
+    renameSync(temporary, path)
+  } finally {
+    if (existsSync(temporary)) rmSync(temporary)
+  }
+}
 function normalize(text) {
-  return text.split('\n').map(line => line.trimEnd()).filter(line => line.trim() !== '').join('\n')
+  return text.split(/\r?\n/).map(line => line.trimEnd()).filter(line => line.trim() !== '').join('\n')
 }
 
-/**
- * Strip the retired seed from $DSH_HOME/settings.yaml. Idempotent: a clean
- * file (or none at all) is left untouched.
- * @param {string} dshHome - $DSH_HOME (defaults to ~/.dsh).
- * @returns {'clean' | 'healed' | 'removed'} what happened, for logging.
- */
-export function ensureShengsuanyunDefaults(dshHome) {
-  const settingsPath = join(dshHome, 'settings.yaml')
-  if (!existsSync(settingsPath)) return 'clean'
-  const text = readFileSync(settingsPath, 'utf8')
-  let lines = text.split(/\r?\n/).filter(line => line !== BEGIN && line !== END)
-  const seedKey = /^llm-shengsuanyun-ai:\s*$/
-  const llmKey = /^llm-pi-ai:\s*$/
-  const llmAt = lines.map((line, i) => (llmKey.test(line) ? i : -1)).filter(i => i >= 0)
-  if (lines.some(line => seedKey.test(line))) {
-    lines = removeSubtree(lines, seedKey)
-  } else if (llmAt.length >= 2) {
-    lines = removeSubtree(lines, llmKey)
-  } else if (llmAt.length === 1) {
-    if (normalize(subtree(lines, llmAt[0]).join('\n')) === normalize(SEED_SECTION)) {
-      lines = removeSubtree(lines, llmKey)
+/** Pure transform; an unrecognized file is returned exactly as received. */
+export function stripRetiredSeed(text) {
+  const newline = text.includes('\r\n') ? '\r\n' : '\n'
+  const lines = text.split(/\r?\n/)
+  const remove = new Set()
+  for (let at = 0; at < lines.length; at++) {
+    if (!/^llm-(?:pi-ai|shengsuanyun-ai):\s*$/.test(lines[at])) continue
+    let end = at + 1
+    while (end < lines.length && !/^[^\s#]/.test(lines[end])) end++
+    // Keep comments belonging to the next section rather than swallowing
+    // them with the historical provider table.
+    let contentEnd = end
+    while (contentEnd > at + 1 && (lines[contentEnd - 1].trim() === '' || /^#/.test(lines[contentEnd - 1]))) contentEnd--
+    const section = lines.slice(at, contentEnd).filter(line => line !== BEGIN && line !== END)
+    section[0] = 'llm-pi-ai:'
+    if (normalize(section.join('\n')) !== normalize(SEED_SECTION)) continue
+    for (let index = at; index < contentEnd; index++) remove.add(index)
+    for (let index = contentEnd; index < end; index++) {
+      if (lines[index] === END) remove.add(index)
+      else if (lines[index].trim() !== '') break
     }
+    let before = at - 1
+    while (before >= 0 && lines[before].trim() === '') before--
+    if (lines[before] === BEGIN) for (let index = before; index < at; index++) remove.add(index)
+    at = end - 1
   }
-  const result = lines.join('\n').replace(/\n{3,}/g, '\n\n').replace(/^\n+/, '').replace(/\s+$/, '')
-  if (result === text.replace(/\s+$/, '')) return 'clean'
-  if (result === '') {
-    rmSync(settingsPath, { force: true })
+  if (remove.size === 0) return text
+  return lines.filter((_, index) => !remove.has(index)).join(newline)
+}
+
+/** Never seeds providers/defaults. No exact legacy match means no filesystem write. */
+export function ensureShengsuanyunDefaults(value) {
+  const home = isolatedHome(value)
+  const path = join(home, 'settings.yaml')
+  assertWithinHome(home, path)
+  if (!existsSync(path)) return 'clean'
+  assertRegularTarget(path)
+  const text = readFileSync(path, 'utf8')
+  const result = stripRetiredSeed(text)
+  if (result === text) return 'clean'
+  if (result.trim() === '') {
+    if (readFileSync(path, 'utf8') !== text) throw new Error('Settings changed during migration; retry')
+    rmSync(path)
     return 'removed'
   }
-  writeFileSync(settingsPath, result + '\n', 'utf8')
+  writeAtomic(path, result, text)
   return 'healed'
 }
 
-/* CLI entry: node scripts/shengsuanyun-defaults.mjs [dshClineHome] */
-if (process.argv[1] !== undefined && process.argv[1].endsWith('shengsuanyun-defaults.mjs')) {
-  const home = process.argv[2]
-    ?? process.env.DSH_CLINE_HOME
-    ?? join(process.env.USERPROFILE ?? process.env.HOME ?? '.', '.dsh-cline')
-  const outcome = ensureShengsuanyunDefaults(home)
-  console.log(outcome === 'clean'
-    ? 'settings.yaml carries no dsh-cline seed; nothing to do'
-    : outcome === 'removed'
-      ? 'removed the seeded ' + join(home, 'settings.yaml') + ' (the DSH settings service owns it)'
-      : 'removed the seeded llm-pi-ai block from ' + join(home, 'settings.yaml'))
+if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  // Only the dedicated override controls a CLI run; DSH_HOME and positional paths do not.
+  const home = isolatedHome()
+  console.log('legacy settings cleanup:', ensureShengsuanyunDefaults(home))
 }

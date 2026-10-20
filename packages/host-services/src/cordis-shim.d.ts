@@ -23,6 +23,7 @@ declare module '@deepseek-ai/cordis' {
 
   /** Effect disposer. */
   type Disposer = () => void
+  interface Volatile<T> { get(): T }
 
   /** Named HTTP route on the DSH web carrier. */
   interface WebRoute {
@@ -42,6 +43,7 @@ declare module '@deepseek-ai/cordis' {
     readonly name: string
     readonly arguments: unknown
     signal: AbortSignal
+    readonly agent?: import('./workspace-context.js').AgentContext
   }
 
   /** Settled outcome of one tool call (subset this plugin reads). */
@@ -63,7 +65,7 @@ declare module '@deepseek-ai/cordis' {
       render(args: unknown, value: unknown): Array<{ type: 'text', text: string }>
     }
     isConcurrencySafe?(args: unknown): boolean
-    execute(args: unknown, exec: { signal: AbortSignal }): Promise<unknown>
+    execute(args: unknown, exec: { signal: AbortSignal; agent?: import('./workspace-context.js').AgentContext }): Promise<unknown>
   }
 
   /** The tools registry service. */
@@ -78,6 +80,8 @@ declare module '@deepseek-ai/cordis' {
 
   /** Plugin context subset used by this plugin. */
   interface Context {
+    readonly fiber: unknown
+    readonly settings: { configure(presentation: { auto?: boolean }, owner?: unknown): Disposer }
     effect(factory: () => Disposer, label?: string): Disposer
     /** Provide an ordinary value service. */
     provide(name: string, value: unknown): void

@@ -39,6 +39,10 @@ class EditPreviewContentStore implements vscode.TextDocumentContentProvider {
   delete(uri: vscode.Uri): void {
     this.contents.delete(uri.toString())
   }
+
+  has(uri: vscode.Uri): boolean { return this.contents.has(uri.toString()) }
+
+  dispose(): void { this.contents.clear(); this.emitter.dispose() }
 }
 
 /** Singleton registered for EDIT_URI_SCHEME in extension.ts. */
@@ -85,6 +89,7 @@ function changedNewLineFlags(left: string, right: string): boolean[] {
   const b = rightLines.slice(newMidStart, newMidEnd)
   const n = a.length
   const m = b.length
+  for (let k = newMidStart; k < newMidEnd; k++) flags[k] = true
   const MAX_LCS = 1500
   if (n > MAX_LCS || m > MAX_LCS) {
     for (let i = newMidStart; i < newMidEnd; i++) flags[i] = true
@@ -109,6 +114,7 @@ function changedNewLineFlags(left: string, right: string): boolean[] {
   let j = m
   while (i > 0 && j > 0) {
     if (a[i - 1] === b[j - 1]) {
+      flags[newMidStart + j - 1] = false
       j--
       i--
     } else if (dp[(i - 1) * stride + j] >= dp[i * stride + j - 1]) {
@@ -143,6 +149,7 @@ export interface EditPreviewAnimation {
 
 /** Cap the sweep to a bounded frame count; oversized results render immediately. */
 const MAX_ANIMATION_FRAMES = 600
+const MAX_ANIMATION_BYTES = 32 * 1024 * 1024
 
 /**
  * Build the simulated-streaming sweep (ported from Cline's buildEditPreviewAnimation).
@@ -154,7 +161,7 @@ export function buildEditPreviewAnimation(left: string, right: string): EditPrev
   const newLines = right.split('\n')
   const originalLines = left.split('\n')
   const changed = changedNewLineFlags(left, right)
-  const firstChangedLine = Math.max(0, changed.indexOf(true))
+  const firstChangedLine = changed.includes(true) ? changed.indexOf(true) : Math.min(firstDifferingLine(left, right), newLines.length - 1)
   const renderImmediately = (): EditPreviewAnimation => ({
     frames: [{ content: right, activeLine: firstChangedLine, delayMs: 0, zip: true }],
     firstChangedLine,
@@ -177,8 +184,10 @@ export function buildEditPreviewAnimation(left: string, right: string): EditPrev
     ) * 2
   }
 
+  let animationBytes = 0
   const appendFrame = (activeLine: number, delayMs: number, zip: boolean): boolean => {
-    if (frames.length + 1 > MAX_ANIMATION_FRAMES) return false
+    animationBytes += frameByteLength(activeLine)
+    if (frames.length + 1 > MAX_ANIMATION_FRAMES || animationBytes > MAX_ANIMATION_BYTES) return false
     frames.push({
       content: [...newLines.slice(0, activeLine + 1), ...originalLines.slice(activeLine + 1)].join('\n'),
       activeLine,
@@ -256,6 +265,7 @@ async function findRightEditor(rightUri: vscode.Uri): Promise<vscode.TextEditor 
 async function animate(rightUri: vscode.Uri, left: string, right: string): Promise<void> {
   const totalLines = right.split('\n').length
   const editor = await findRightEditor(rightUri)
+  if (!editPreviewContentProvider.has(rightUri)) return
   if (!editor || totalLines > MAX_ANIMATED_LINES) {
     editPreviewContentProvider.set(rightUri, right)
     const firstDiff = firstDifferingLine(left, right)
@@ -272,6 +282,7 @@ async function animate(rightUri: vscode.Uri, left: string, right: string): Promi
   editor.revealRange(new vscode.Range(0, 0, 0, 0), vscode.TextEditorRevealType.AtTop)
   await delay(300)
   for (const frame of frames) {
+    if (!editPreviewContentProvider.has(rightUri)) return
     editPreviewContentProvider.set(rightUri, frame.content)
     editor.revealRange(
       new vscode.Range(frame.activeLine, 0, frame.activeLine, 0),
@@ -291,22 +302,29 @@ export async function openEditPreview(req: EditPreviewRequest): Promise<string> 
   lastPreview = { ...req }
   const path = req.path
   const previewId = nextPreviewId++
-  const leftUri = vscode.Uri.parse(`${EDIT_URI_SCHEME}:${path}`).with({ query: `preview-${previewId}-left` })
-  const rightUri = vscode.Uri.parse(`${EDIT_URI_SCHEME}:${path}`).with({ query: `preview-${previewId}-right` })
+  const leftUri = vscode.Uri.file(path).with({ scheme: EDIT_URI_SCHEME, query: `preview-${previewId}-left` })
+  const rightUri = vscode.Uri.file(path).with({ scheme: EDIT_URI_SCHEME, query: `preview-${previewId}-right` })
   // Left is immutable original; the right starts as the original and the sweep types
   // the new content in.
   editPreviewContentProvider.set(leftUri, req.leftContent)
   editPreviewContentProvider.set(rightUri, req.leftContent)
 
   const title = `DSH 变更 · ${baseName(path)}`
-  await vscode.commands.executeCommand('vscode.diff', leftUri, rightUri, title, {
-    preview: false,
-    preserveFocus: true,
-  })
+  try {
+    await vscode.commands.executeCommand('vscode.diff', leftUri, rightUri, title, {
+      preview: false,
+      preserveFocus: true,
+    })
+  } catch (err: unknown) {
+    editPreviewContentProvider.delete(leftUri)
+    editPreviewContentProvider.delete(rightUri)
+    throw err
+  }
 
   // Fire-and-forget: the sweep plays while DSH applies the write, so the change is
   // visible as it lands rather than popping in after the tool finishes.
   void animate(rightUri, req.leftContent, req.rightContent).catch((err: unknown) => {
+    if (!editPreviewContentProvider.has(rightUri)) return
     editPreviewContentProvider.set(rightUri, req.rightContent)
     vscode.window.showInformationMessage('DSH 变更预览动画失败: ' + String(err))
   })

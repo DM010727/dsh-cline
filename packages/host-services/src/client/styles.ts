@@ -12,6 +12,7 @@
  */
 
 export const CLIENT_CSS = `
+.dshc-provider-login { margin:8px 0 0; padding:10px 0 0; border-top:1px solid var(--dsw-alias-border-l2); }
 .dshc-modal { position: fixed; inset: 0; z-index: 60; display: flex; align-items: center; justify-content: center; background: var(--dsw-mask-blur, rgba(0,0,0,.45)); }
 .dshc-modal-card { width: min(480px, calc(100vw - 48px)); max-height: calc(100vh - 64px); overflow: auto; background: var(--dsw-alias-bg-layer-1); color: var(--dsw-alias-label-primary); border: 1px solid var(--dsw-alias-border-l2); border-radius: 12px; padding: 22px 24px; box-shadow: 0 12px 40px rgba(0,0,0,.25); font-family: inherit; }
 .dshc-modal-card h2 { margin: 0 0 6px; font-size: 16px; color: var(--dsw-alias-label-primary); }
@@ -46,6 +47,13 @@ export const CLIENT_CSS = `
 .dshc-seg button { background: transparent; color: var(--dsw-alias-label-secondary); border: 0; padding: 6px 12px; font-size: 12px; cursor: pointer; }
 .dshc-seg button.on { background: var(--dsw-alias-button-primary-fill); color: var(--dsw-alias-label-primary-foreground); }
 .dshc-model-filter { margin: 0 0 6px; }
+/* Model injection checkbox list (multi-select replacement). */
+.dshc-mchk-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 2px 0 6px; flex-wrap: wrap; }
+.dshc-mchk-list { max-height: 340px; overflow-y: auto; border: 1px solid var(--dsw-alias-border-l3); border-radius: 7px; background: var(--dsw-alias-bg-module-platform); padding: 2px 0; }
+.dshc-mchk-head { display: flex; align-items: center; gap: 8px; padding: 6px 10px; font-size: 12px; font-weight: 600; color: var(--dsw-alias-label-secondary); cursor: pointer; user-select: none; position: sticky; top: 0; background: var(--dsw-alias-bg-module-platform); }
+.dshc-mchk-item { display: flex; align-items: center; gap: 8px; padding: 4px 10px 4px 24px; font-size: 13px; color: var(--dsw-alias-label-primary); cursor: pointer; user-select: none; }
+.dshc-mchk-item:hover { background: var(--dsw-alias-interactive-bg-hover); }
+.dshc-mchk-head input, .dshc-mchk-item input { accent-color: var(--dsw-alias-brand-primary); cursor: pointer; flex: none; margin: 0; }
 .dshc-empty { padding: 24px; text-align: center; color: var(--dsw-alias-label-secondary); font-size: 13px; }
 .dshc-badge { display: inline-block; font-size: 10px; color: var(--dsw-alias-label-primary-foreground); background: var(--dsw-alias-brand-primary); border-radius: 4px; padding: 1px 6px; margin-left: 6px; vertical-align: 1px; }
 .dshc-banner { background: var(--dsw-alias-state-warn-label, #6b5a1e); color: var(--dsw-alias-label-primary-foreground, #fff); border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; padding: 10px 12px; font-size: 12px; margin: 0 0 12px; }
