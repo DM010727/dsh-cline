@@ -6,16 +6,6 @@
 
 [在 VS Code 安装](https://marketplace.visualstudio.com/items?itemName=shengsuan-cloud.cline-shengsuan) · [加入交流群](#交流群) · [快速开始](#快速开始) · [RSI 使用指南](docs/RSI-使用指南.md) · [自定义 RSI](#按项目配置开关模型与学习流程)
 
-<a id="交流群"></a>
-
-### DSH · 项目级 RSI 心得交流群
-
-**微信扫码入群，交流使用经验、反馈问题与改进建议。**
-
-<a href="https://raw.githubusercontent.com/DM010727/dsh-cline/main/packages/extension/media/readme/community-qr.jpg"><img src="https://raw.githubusercontent.com/DM010727/dsh-cline/main/packages/extension/media/readme/community-qr.jpg" alt="DSH 项目级 RSI 心得交流群微信二维码" width="340"></a>
-
-二维码有效期以图片标注为准；点击图片可查看原图。
-
 </div>
 
 > **开源范围：** GitHub 提供 DSH Cline 的 VS Code 集成、运行时管理、模型配置、Diff、剪贴板、工作区与 MCP 等基础功能源码，采用 MIT 许可。**RSI 仍处于试验阶段，暂不开源，待研究完成并稳定后开放。** 下方 RSI 介绍和演示对应扩展试验功能；从公开仓库构建的版本不包含 RSI。
@@ -189,6 +179,14 @@ node packages/host-services/scripts/audit-regressions.mjs
 - 修复复盘模型选择、任务状态与管理中心切换问题；保存失败会明确提示。
 - 保留原左侧插件栏约半屏布局，内部项目与会话侧栏保持展开。
 - 打包强制重新构建，并检查最终安装包的文字、图片、快捷键及右键复制粘贴链路。
+
+## 交流群
+
+微信扫码加入 **DSH · 项目级 RSI 心得交流群**，交流使用经验、反馈问题。
+
+<a href="https://raw.githubusercontent.com/DM010727/dsh-cline/main/packages/extension/media/readme/community-qr.jpg"><img src="https://raw.githubusercontent.com/DM010727/dsh-cline/main/packages/extension/media/readme/community-qr-cropped.png" alt="DSH 项目级 RSI 心得交流群微信二维码" width="220" height="220"></a>
+
+二维码有效至 10 月 29 日前，点击可查看原图。
 
 ## 开源与致谢
 
