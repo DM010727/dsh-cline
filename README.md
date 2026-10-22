@@ -4,7 +4,17 @@
 
 **基于 DeepSeek Harness 的 VS Code AI Agent，集成 Cline 式交互与项目级 RSI。**
 
-[在 VS Code 安装](https://marketplace.visualstudio.com/items?itemName=shengsuan-cloud.cline-shengsuan) · [快速开始](#快速开始) · [RSI 使用指南](docs/RSI-使用指南.md) · [自定义 RSI](#按项目配置开关模型与学习流程)
+[在 VS Code 安装](https://marketplace.visualstudio.com/items?itemName=shengsuan-cloud.cline-shengsuan) · [加入交流群](#交流群) · [快速开始](#快速开始) · [RSI 使用指南](docs/RSI-使用指南.md) · [自定义 RSI](#按项目配置开关模型与学习流程)
+
+<a id="交流群"></a>
+
+### DSH · 项目级 RSI 心得交流群
+
+**微信扫码入群，交流使用经验、反馈问题与改进建议。**
+
+<a href="https://raw.githubusercontent.com/DM010727/dsh-cline/main/packages/extension/media/readme/community-qr.jpg"><img src="https://raw.githubusercontent.com/DM010727/dsh-cline/main/packages/extension/media/readme/community-qr.jpg" alt="DSH 项目级 RSI 心得交流群微信二维码" width="340"></a>
+
+二维码有效期以图片标注为准；点击图片可查看原图。
 
 </div>
 
@@ -21,7 +31,7 @@ DSH Cline 由 [SSYCloud 胜算云](https://www.shengsuanyun.com/?from=CH_L5K542D
 | DSH 任务执行 | VS Code × Cline 交互 | 项目级 RSI |
 | :--- | :--- | :--- |
 | 模型调用、会话、工具执行与 MCP 扩展 | 选区和诊断进入任务；文件操作与原生 Diff 连接编辑器 | 明确记录、任务复盘、经验召回与真实反馈评测 |
-| 沿用 DSH 审批策略，检查点保存工作区文件 | 启动默认右侧分屏，复用同路径工作区 | 项目隔离、独立复盘模型、自定义规范、策略验证与回滚 |
+| 沿用 DSH 审批策略，检查点保存工作区文件 | 左侧插件栏默认约半屏，复用同路径工作区 | 项目隔离、独立复盘模型、自定义规范、策略验证与回滚 |
 
 ## RSI 操作演示
 
@@ -36,7 +46,7 @@ DSH Cline 由 [SSYCloud 胜算云](https://www.shengsuanyun.com/?from=CH_L5K542D
 **将编辑器上下文交给 DSH，让 Agent 的文件操作通过原生界面呈现。**
 
 1. **选中代码。** 右键或小灯泡选择「添加到 DSH Cline」「用 DSH Cline 解释」「用 DSH Cline 优化」，同时带上选区、文件路径和相交的诊断信息。
-2. **并排处理任务。** 首次打开 DSH Cline 时，普通单栏编辑器会分成左右两栏，代码与对话各占约一半；再次打开复用面板，已有多栏布局保留。进入插件时，默认创建或复用与 VS Code 项目**路径一致**的 DSH 工作区。
+2. **并排处理任务。** 打开 DSH Cline 时，原左侧插件栏默认调整到窗口约一半宽度，代码继续在编辑器中显示；插件内部的项目与会话侧栏保持展开。进入插件时，默认创建或复用与 VS Code 项目**路径一致**的 DSH 工作区。
 3. **原生 Diff 预览。** 支持的文件编辑工具获准执行后、写入前捕获真实原稿，通过 VS Code 原生 Diff 逐步展示拟议修改；命令面板可「重新打开最近一次变更 diff」。
 
 Agent 还可以打开文件并定位到行、读取选区及通过有效选区凭据写回内容。服务输出在「DSH Cline 服务」终端查看，任务中的工具执行与结果在会话中查看。输入框支持 Windows Ctrl、macOS Cmd 剪贴板快捷键与右键操作。
@@ -61,7 +71,7 @@ RSI 围绕任务执行形成持续反馈流程：
 
 ### 在对话中记录与提炼经验
 
-开启项目 RSI 后，在对话中提出明确要求，例如「这个项目以后请用中文说明改动，先说结果，再说验证方法」。RSI 自动识别、保存，并返回项目与经验 ID；普通闲聊不会一律存为偏好。
+开启项目 RSI 后，在对话中提出明确要求，例如「这个项目以后请用中文说明改动，先说结果，再说验证方法」。RSI 自动识别、保存，并返回项目与经验 ID；自然纠正会自动记录为待确认候选，由你采纳后生效。普通闲聊不会一律存为偏好。
 
 也可以随时用斜杠命令：
 
@@ -172,13 +182,13 @@ node packages/host-services/scripts/audit-regressions.mjs
 
 </details>
 
-## 4.5.1 更新
+## 4.5.5 更新
 
-- 启动时自动打开右侧编辑器面板，普通单栏布局默认左右均分，重复打开复用面板。
-- 修复嵌入式输入框剪贴板兼容；进入插件时创建或复用同路径工作区。
-- RSI 按实际会话定位项目；支持直接以 0 次开启、跟随任务模型或指定复盘模型。
-- 移除 RSI 单次输入字符与输出 token 配置限制，兼容旧配置；同版本覆盖安装也会更新变化的宿主内容。
-- 重排项目与商店介绍，补充产品概览、真实 RSI 组件截图，以及自动识别、斜杠命令和后续召回的流程 GIF。
+- RSI 自动保存明确要求与纠正候选；修复多句要求截断，以及 `/rsi-learn` 误报没有可学习对话。
+- 加强项目与开关隔离；经验修改、暂停或忘记后，后续步骤会收到失效通知。
+- 修复复盘模型选择、任务状态与管理中心切换问题；保存失败会明确提示。
+- 保留原左侧插件栏约半屏布局，内部项目与会话侧栏保持展开。
+- 打包强制重新构建，并检查最终安装包的文字、图片、快捷键及右键复制粘贴链路。
 
 ## 开源与致谢
 
